@@ -1,4 +1,7 @@
-name = "pingflare"
+# Must match the deployed Worker. The live instance is "q-pingflare"; deploying
+# under a different name creates a SECOND Worker bound to the same D1, so both
+# crons run and every check is written twice.
+name = "q-pingflare"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
@@ -14,11 +17,37 @@ run_worker_first = true
 [[d1_databases]]
 binding = "DB"
 database_name = "pingflare"
+# Required for any remote CLI operation (migrations apply/list, d1 info, d1 execute).
+# `wrangler deploy` resolves the binding by name without it, which is why this was
+# missing while deploys still worked.
+database_id = "1fdfc5cb-214f-482a-a727-e89741b974d0"
 migrations_dir = "drizzle"
 
+# Caches the expensive historical aggregates (90-day charts, long-window uptime).
+# Optional: with no namespace bound, those reads go straight to D1 and everything
+# still works.
+#
+# Sized for the KV free tier, where writes are the binding limit (1,000/day, vs
+# 100,000 reads). A cache write only happens on a miss, so the write rate per key
+# is 86400 / cache_ttl -- 96/day at the default 900s. See src/cache.ts.
+#
+# The binding name must stay CACHE; `wrangler kv namespace create` suggests a name
+# derived from the title, which the code does not read.
+[[kv_namespaces]]
+binding = "CACHE"
+id = "601d57451663442c98d7ead4e4d34896"
+
+# The scheduled trigger is the floor on how often any monitor can be checked, so
+# it also sets the write rate: roughly 6 rows written per check (log row + its
+# index entry, the daily_stats bucket, the monitor row, and the amortised
+# retention delete).
+#
+# At 20 monitors that is ~35k rows written/day here, against a 100k/day free-tier
+# limit. "*/2" (~86k/day) is the tightest safe setting; "* * * * *" would be
+# ~173k/day and blow the limit.
 [triggers]
 crons = [
-  "* * * * *"
+  "*/5 * * * *"
 ]
 
 [placement]
