@@ -17,6 +17,12 @@ import { ensureSchema } from './db/migrate'
 
 export type Env = {
   DB: D1Database
+  /**
+   * Optional KV namespace used to cache the expensive historical aggregates.
+   * Unbound is a supported configuration: every cache call falls through to a
+   * direct D1 read. See src/cache.ts.
+   */
+  CACHE?: KVNamespace
   ASSETS: Fetcher
   ADMIN_USER: string
   ADMIN_PASS: string
@@ -28,7 +34,14 @@ const app = new Hono<{ Bindings: Env }>()
 
 app.use('/api/*', cors())
 
-app.use('*', async (c, next) => {
+// Scoped to the routes that touch the database. It used to run on '*', which
+// with `run_worker_first` meant every static asset request paid for it too.
+app.use('/api/*', async (c, next) => {
+  await ensureSchema(c.env.DB)
+  await next()
+})
+
+app.use('/h/*', async (c, next) => {
   await ensureSchema(c.env.DB)
   await next()
 })

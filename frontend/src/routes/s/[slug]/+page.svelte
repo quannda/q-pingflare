@@ -48,7 +48,9 @@
     load()
     ticker = setInterval(() => {
       countdown = countdown <= 1 ? 60 : countdown - 1
-      if (countdown === 60) load(password || undefined)
+      // Skipped while the tab is hidden -- a status page left open on a wall
+      // display in a background tab was refetching for nobody.
+      if (countdown === 60 && !document.hidden) load(password || undefined)
     }, 1000)
     document.addEventListener('fullscreenchange', onFullscreenChange)
   })

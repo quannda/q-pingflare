@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, primaryKey } from 'drizzle-orm/sqlite-core'
+import { sqliteTable, text, integer, primaryKey, index } from 'drizzle-orm/sqlite-core'
 import { sql } from 'drizzle-orm'
 
 export const monitors = sqliteTable('monitors', {
@@ -45,7 +45,28 @@ export const statusLogs = sqliteTable('status_logs', {
   colo: text('colo'),
   countryCode: text('country_code'),
   originIp: text('origin_ip'),
-})
+}, (t) => [
+  // Every hot query filters by (monitor_id, checked_at). Without this every read
+  // is a full table scan. Deliberately the ONLY secondary index on this table:
+  // D1 bills each index entry as a row written, so each extra index costs one
+  // extra write per check.
+  index('idx_status_logs_monitor_checked').on(t.monitorId, t.checkedAt),
+])
+
+/**
+ * Pre-aggregated per-day rollup of status_logs, maintained incrementally by the
+ * cron. Long-range uptime/history reads hit this table (90 rows per monitor)
+ * instead of scanning raw logs (~130k rows per monitor at a 60s interval).
+ * `day` is the UTC day number, i.e. floor(checked_at / 86400).
+ */
+export const dailyStats = sqliteTable('daily_stats', {
+  monitorId: text('monitor_id').notNull().references(() => monitors.id, { onDelete: 'cascade' }),
+  day: integer('day').notNull(),
+  total: integer('total').notNull().default(0),
+  ups: integer('ups').notNull().default(0),
+  rtSum: integer('rt_sum').notNull().default(0),
+  rtCount: integer('rt_count').notNull().default(0),
+}, (t) => [primaryKey({ columns: [t.monitorId, t.day] })])
 
 export const incidents = sqliteTable('incidents', {
   id: text('id').primaryKey(),
@@ -53,7 +74,7 @@ export const incidents = sqliteTable('incidents', {
   startedAt: integer('started_at').notNull(),
   resolvedAt: integer('resolved_at'),
   durationSeconds: integer('duration_seconds'),
-})
+}, (t) => [index('idx_incidents_monitor_started').on(t.monitorId, t.startedAt)])
 
 export const notificationChannels = sqliteTable('notification_channels', {
   id: text('id').primaryKey(),
@@ -126,11 +147,15 @@ export const incidentUpdates = sqliteTable('incident_updates', {
 export const incidentMonitors = sqliteTable('incident_monitors', {
   incidentId: text('incident_id').notNull().references(() => incidentReports.id, { onDelete: 'cascade' }),
   monitorId: text('monitor_id').notNull().references(() => monitors.id, { onDelete: 'cascade' }),
-}, (t) => [primaryKey({ columns: [t.incidentId, t.monitorId] })])
+}, (t) => [
+  primaryKey({ columns: [t.incidentId, t.monitorId] }),
+  index('idx_incident_monitors_monitor').on(t.monitorId),
+])
 
 export type Monitor = typeof monitors.$inferSelect
 export type NewMonitor = typeof monitors.$inferInsert
 export type StatusLog = typeof statusLogs.$inferSelect
+export type DailyStat = typeof dailyStats.$inferSelect
 export type Incident = typeof incidents.$inferSelect
 export type NotificationChannel = typeof notificationChannels.$inferSelect
 export type AlertState = typeof alertState.$inferSelect

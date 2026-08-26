@@ -36,7 +36,7 @@ npm run dev:cron
 
 #### Cron simulator
 
-`dev:cron` hits `http://localhost:8787/__scheduled?cron=*+*+*+*+*` every 60 seconds, replicating the `* * * * *` trigger from `wrangler.toml`.
+`dev:cron` hits `http://localhost:8787/__scheduled?cron=*+*+*+*+*` every 60 seconds. Production uses the `*/5 * * * *` trigger from `wrangler.toml` to stay inside the D1 free-tier write budget; locally the faster tick just gives quicker feedback.
 
 To trigger the cron manually:
 

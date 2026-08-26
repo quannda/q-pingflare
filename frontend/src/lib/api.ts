@@ -41,6 +41,10 @@ export const api = {
 
   monitors: {
     list:   () => request<Monitor[]>('/monitors'),
+    /** Dashboard payload: monitor rows plus their 30-day uptime, in one request. */
+    overview: () => request<MonitorOverview>('/monitors/overview'),
+    /** Monitor detail payload: replaces nine separate history requests. */
+    summary: (id: string) => request<MonitorSummary>(`/monitors/${id}/summary`),
     get:    (id: string) => request<Monitor>(`/monitors/${id}`),
     create: (data: MonitorPayload) => request<Monitor>('/monitors', { method: 'POST', body: JSON.stringify(data) }),
     update: (id: string, data: MonitorPayload) => request<Monitor>(`/monitors/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -65,6 +69,7 @@ export const api = {
   settings: {
     get:    () => request<Record<string, string>>('/settings'),
     update: (data: Record<string, string>) => request<Record<string, string>>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
+    rebuildStats: () => request<{ ok: boolean }>('/settings/rebuild-stats', { method: 'POST' }),
   },
 
   backup: {
@@ -138,6 +143,26 @@ export interface Monitor {
   cacheBooster: boolean
   createdAt: number
   updatedAt: number
+}
+
+export interface MonitorOverview {
+  monitors: Monitor[]
+  uptime30: Record<string, number | null>
+}
+
+export interface MonitorSummary {
+  monitor: Monitor
+  /** Most recent checks, newest first -- feeds both the response-time chart and the log table. */
+  logs: StatusLog[]
+  incidents: Incident[]
+  daily: DailyUptime[]
+  uptime1: number | null
+  uptime7: number | null
+  uptime30: number | null
+  uptime90: number | null
+  checkCount: number
+  /** Mean response time over the last 24h, computed server-side. */
+  avgResponseMs: number | null
 }
 
 export interface StatusLog {

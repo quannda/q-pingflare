@@ -4,6 +4,7 @@
   import { page } from '$app/stores'
   import { theme, monitors } from '$lib/stores'
   import { t } from '$lib/i18n'
+  import { POLL_INTERVAL_MS } from '$lib/poll'
   import Icon from '$lib/components/Icon.svelte'
 
   const APP_VERSION = __APP_VERSION__
@@ -29,7 +30,7 @@
     return false
   }
 
-  let countdown = 10
+  let countdown = POLL_INTERVAL_MS / 1000
   let countTicker: ReturnType<typeof setInterval>
   let updateAvailable = false
   let latestVersion = ''
@@ -38,7 +39,7 @@
   onMount(async () => {
     if (!localStorage.getItem('token')) goto('/login')
     countTicker = setInterval(() => {
-      countdown = countdown <= 1 ? 10 : countdown - 1
+      countdown = countdown <= 1 ? POLL_INTERVAL_MS / 1000 : countdown - 1
     }, 1000)
 
     const cacheKey = 'pf_latest_version'

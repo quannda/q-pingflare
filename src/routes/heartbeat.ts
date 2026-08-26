@@ -1,8 +1,10 @@
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { eq } from 'drizzle-orm'
-import { getDb, heartbeatTokens, monitors, statusLogs, alertState } from '../db'
+import { getDb, heartbeatTokens, monitors, statusLogs } from '../db'
 import { processAlert, getLocale } from '../services/alert-manager'
+import { recordCheck } from '../services/stats'
+import { cacheKeys, invalidate } from '../cache'
 import { msgHeartbeatReceived } from '../notifications/messages'
 import type { Env } from '../index'
 
@@ -40,12 +42,15 @@ async function handleHeartbeat(c: Context<{ Bindings: Env }>) {
     responseTimeMs: null,
     checkedAt: now,
   })
+  await recordCheck(db, monitor.id, now, 'up', null)
 
-  await processAlert({ db, monitor, status: 'up', message: receivedMsg })
+  // processAlert already clears alert_state on a healthy check; the explicit
+  // update that used to follow was a second row written on every ping.
+  await processAlert({ db, monitor, status: 'up', message: receivedMsg, locale })
 
-  await db.update(alertState)
-    .set({ consecutiveMissed: 0, alertSentAt: null, consecutiveAlerts: 0, surgePausedUntil: null })
-    .where(eq(alertState.monitorId, monitor.id))
+  if (monitor.lastStatus !== 'up') {
+    await invalidate(c.env, cacheKeys.overview(), cacheKeys.monitor(monitor.id))
+  }
 
   return new Response(null, {
     status: 200,

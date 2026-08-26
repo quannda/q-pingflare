@@ -11,6 +11,8 @@ export interface AlertContext {
   status: 'up' | 'down'
   message: string
   responseTimeMs?: number | null
+  /** Passed in by callers that already loaded the settings row, to skip a read. */
+  locale?: string
   encryptionKey?: string
 }
 
@@ -35,8 +37,12 @@ export async function processAlert(ctx: AlertContext): Promise<void> {
     }
   }
 
-  const channels = await getChannels(db, monitor.id)
-  const locale = await getLocale(db)
+  // Loaded lazily: the overwhelming majority of checks dispatch nothing, and this
+  // join costs two reads every time it runs.
+  let channelsCache: NotificationChannel[] | null = null
+  const channels = async () => (channelsCache ??= await getChannels(db, monitor.id))
+
+  const locale = ctx.locale ?? await getLocale(db)
   const prevStatus = monitor.lastStatus
 
   if (status === 'down') {
@@ -82,7 +88,7 @@ export async function processAlert(ctx: AlertContext): Promise<void> {
         responseTimeMs,
         locale,
       }
-      await dispatchToChannels(channels, payload, encryptionKey)
+      await dispatchToChannels(await channels(), payload, encryptionKey)
       await db.update(alertState)
         .set({ alertSentAt: now, consecutiveAlerts: (state.consecutiveAlerts ?? 0) + 1, lastReminderAt: now })
         .where(eq(alertState.monitorId, monitor.id))
@@ -108,7 +114,7 @@ export async function processAlert(ctx: AlertContext): Promise<void> {
             incidentStartedAt: incident?.startedAt,
             locale,
           }
-          await dispatchToChannels(channels, payload, encryptionKey)
+          await dispatchToChannels(await channels(), payload, encryptionKey)
           await db.update(alertState)
             .set({ lastReminderAt: now })
             .where(eq(alertState.monitorId, monitor.id))
@@ -119,16 +125,21 @@ export async function processAlert(ctx: AlertContext): Promise<void> {
   } else {
     const wasDown = prevStatus === 'down'
 
-    await db.update(alertState)
-      .set({
-        consecutiveFailures: 0,
-        consecutiveMissed: 0,
-        alertSentAt: null,
-        consecutiveAlerts: 0,
-        lastReminderAt: null,
-        surgePausedUntil: null,
-      })
-      .where(eq(alertState.monitorId, monitor.id))
+    // The steady state is "up with nothing to reset". Writing the same zeroes
+    // back on every healthy check was one wasted row written per check, which at
+    // 20 monitors on a 60s interval is ~29k of the 100k daily free-tier budget.
+    if (isDirty(state)) {
+      await db.update(alertState)
+        .set({
+          consecutiveFailures: 0,
+          consecutiveMissed: 0,
+          alertSentAt: null,
+          consecutiveAlerts: 0,
+          lastReminderAt: null,
+          surgePausedUntil: null,
+        })
+        .where(eq(alertState.monitorId, monitor.id))
+    }
 
     const orphanedIncident = !wasDown ? await getOpenIncident(db, monitor.id) : null
 
@@ -142,11 +153,20 @@ export async function processAlert(ctx: AlertContext): Promise<void> {
         responseTimeMs,
         locale,
       }
-      await dispatchToChannels(channels, payload, encryptionKey)
+      await dispatchToChannels(await channels(), payload, encryptionKey)
     }
 
     await updateMonitorStatus(db, monitor.id, 'up', now)
   }
+}
+
+function isDirty(state: AlertState): boolean {
+  return state.consecutiveFailures !== 0
+    || state.consecutiveMissed !== 0
+    || state.alertSentAt !== null
+    || state.consecutiveAlerts !== 0
+    || state.lastReminderAt !== null
+    || state.surgePausedUntil !== null
 }
 
 async function getChannels(db: Db, monitorId: string): Promise<NotificationChannel[]> {

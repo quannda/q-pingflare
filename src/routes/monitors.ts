@@ -1,7 +1,9 @@
 import { Hono } from 'hono'
 import { eq } from 'drizzle-orm'
-import { getDb, monitors, heartbeatTokens, alertState, monitorNotifications, statusLogs, incidents } from '../db'
+import { getDb, monitors, heartbeatTokens, alertState, monitorNotifications, statusLogs, incidents, dailyStats } from '../db'
 import { requireAuth } from '../middleware/auth'
+import { cacheKeys, cached, cacheTtl, invalidate } from '../cache'
+import { loadSettings, uptimeBulk } from '../services/stats'
 import type { Env } from '../index'
 
 const router = new Hono<{ Bindings: Env }>()
@@ -11,6 +13,36 @@ router.get('/', async (c) => {
   const db = getDb(c.env.DB)
   const rows = await db.select().from(monitors)
   return c.json(rows)
+})
+
+/**
+ * Dashboard payload in one request. The dashboard used to fetch the monitor list
+ * and then one uptime call per monitor, each a full scan of status_logs.
+ *
+ * Registered before '/:id' so the literal path wins the route match.
+ *
+ * The monitor rows are read live (that is where up/down state lives, and it is
+ * one row per monitor); only the 30-day uptime aggregate is KV-cached.
+ */
+router.get('/overview', async (c) => {
+  const db = getDb(c.env.DB)
+  const now = Math.floor(Date.now() / 1000)
+
+  const [rows, allSettings] = await Promise.all([
+    db.select().from(monitors),
+    loadSettings(db),
+  ])
+
+  const ids = rows.map(r => r.id)
+  const uptime = await cached(c.env, cacheKeys.overview(), cacheTtl(allSettings), async () => {
+    const totals = await uptimeBulk(db, ids, 30, now)
+    return Object.fromEntries([...totals].map(([id, t]) => [id, t.uptime]))
+  })
+
+  return c.json({
+    monitors: rows,
+    uptime30: uptime as Record<string, number | null>,
+  })
 })
 
 router.get('/:id', async (c) => {
@@ -75,6 +107,8 @@ router.post('/', async (c) => {
     }
   }
 
+  await invalidate(c.env, cacheKeys.overview())
+
   const created = await db.query.monitors.findFirst({ where: eq(monitors.id, id) })
   return c.json(created, 201)
 })
@@ -131,6 +165,7 @@ router.delete('/:id', async (c) => {
   const db = getDb(c.env.DB)
   const id = c.req.param('id')
   await db.delete(monitors).where(eq(monitors.id, id))
+  await invalidate(c.env, cacheKeys.overview(), cacheKeys.monitor(id))
   return c.json({ ok: true })
 })
 
@@ -161,6 +196,7 @@ router.post('/:id/reset-stats', async (c) => {
   if (!monitor) return c.json({ error: 'Not found' }, 404)
 
   await db.delete(statusLogs).where(eq(statusLogs.monitorId, id))
+  await db.delete(dailyStats).where(eq(dailyStats.monitorId, id))
   await db.delete(incidents).where(eq(incidents.monitorId, id))
   await db.update(alertState).set({
     consecutiveFailures: 0,
@@ -174,6 +210,8 @@ router.post('/:id/reset-stats', async (c) => {
     lastStatus: 'pending',
     lastCheckedAt: null,
   }).where(eq(monitors.id, id))
+
+  await invalidate(c.env, cacheKeys.overview(), cacheKeys.monitor(id))
 
   return c.json({ ok: true })
 })

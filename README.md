@@ -121,9 +121,40 @@ fly deploy
 When running on Cloudflare Workers, Pingflare is designed to stay within free tier limits:
 
 - Workers: 100,000 requests per day
-- D1: 100,000 write rows per day, 5 million read rows per day
+- D1: 100,000 rows written per day, 5,000,000 rows read per day
+- KV (optional cache): 100,000 reads, 1,000 writes, 1,000 deletes per day
 - Cron Triggers: minimum 1-minute interval
 
-With the default 90-day log retention and automatic cleanup on each cron run, write usage stays bounded proportional to the number of active monitors.
+### Rows written — this sets your check interval
+
+Each check writes roughly **6 rows**: the log row plus its index entry, the
+`daily_stats` bucket, the monitor row, and the amortised retention delete.
+
+The scheduled trigger in `wrangler.toml` is the floor on how often any monitor can
+be checked, so it also sets the write rate:
+
+| Trigger | 20 monitors | Verdict |
+|---|---|---|
+| `* * * * *` | ~173k rows/day | over the limit |
+| `*/2 * * * *` | ~86k rows/day | tightest safe setting |
+| `*/5 * * * *` | ~35k rows/day | default, comfortable headroom |
+
+Note that a monitor's own `interval` cannot beat the trigger: with a `*/5` trigger,
+a monitor set to 60s is still only checked every 5 minutes.
+
+### Rows read
+
+Long-range history is served from a per-day rollup table (`daily_stats`) instead of
+scanning the raw logs, so a 90-day chart reads 90 rows rather than every check in
+the window. All hot lookups are covered by an index on
+`status_logs (monitor_id, checked_at)`.
+
+Binding a KV namespace (see the commented block in `wrangler.toml`) caches those
+aggregates on top of that. It is optional — without it the aggregate reads simply
+go to D1. Current up/down state is never cached, so status badges stay live either
+way.
+
+The dashboard and detail views each fetch their data in a single request and pause
+refreshing while the browser tab is hidden.
 
 > When running in Docker mode, there are no such limits — SQLite has no row quotas and the cron runs on the same Node.js process.

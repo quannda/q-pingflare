@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation'
   import { page } from '$app/stores'
   import { api } from '$lib/api'
+  import { startPolling } from '$lib/poll'
   import { t, locale } from '$lib/i18n'
   import { get } from 'svelte/store'
   import type { Monitor, StatusLog, Incident, DailyUptime } from '$lib/api'
@@ -24,44 +25,37 @@
 
   let monitor: Monitor | null = null
   let logs: StatusLog[] = []
-  let recentLogs: StatusLog[] = []
   let incidents: Incident[] = []
   let daily: DailyUptime[] = []
   let uptime30: number | null = null
   let uptime1: number | null = null
   let uptime7: number | null = null
   let uptime90: number | null = null
+  let avgResponseTime: number | null = null
   let hbToken: string | null = null
   let checkCount = 0
   let loading = true
   let error = ''
-  let ticker: ReturnType<typeof setInterval>
+  let stopPolling: () => void
   let copied = false
   let running = false
   let logsPage = 0
 
   async function load() {
     try {
-      monitor = await api.monitors.get(id)
-      ;[logs, recentLogs, incidents, daily] = await Promise.all([
-        api.monitors.logs(id, 24),
-        api.monitors.recentLogs(id, 200),
-        api.monitors.incidents(id),
-        api.monitors.daily(id, 90),
-      ])
-      const [u1, u7, u30, u90, countData] = await Promise.all([
-        api.monitors.uptime(id, 1),
-        api.monitors.uptime(id, 7),
-        api.monitors.uptime(id, 30),
-        api.monitors.uptime(id, 90),
-        api.monitors.checkCount(id),
-      ])
-      uptime1 = u1.uptime
-      uptime7 = u7.uptime
-      uptime30 = u30.uptime
-      uptime90 = u90.uptime
-      checkCount = countData.count
-      if (monitor?.type === 'heartbeat') {
+      // One request. This page used to issue nine per refresh, every 10s.
+      const summary = await api.monitors.summary(id)
+      monitor = summary.monitor
+      logs = summary.logs
+      incidents = summary.incidents
+      daily = summary.daily
+      uptime1 = summary.uptime1
+      uptime7 = summary.uptime7
+      uptime30 = summary.uptime30
+      uptime90 = summary.uptime90
+      checkCount = summary.checkCount
+      avgResponseTime = summary.avgResponseMs
+      if (monitor?.type === 'heartbeat' && hbToken === null) {
         const tok = await api.monitors.hbToken(id)
         hbToken = tok.token
       }
@@ -129,12 +123,8 @@
     setTimeout(() => copied = false, 2000)
   }
 
-  onMount(() => { load(); ticker = setInterval(load, 10_000) })
-  onDestroy(() => clearInterval(ticker))
-
-  $: avgResponseTime = logs.length && logs.filter(l => l.responseTimeMs).length
-    ? Math.round(logs.filter(l => l.responseTimeMs).reduce((s, l) => s + (l.responseTimeMs ?? 0), 0) / logs.filter(l => l.responseTimeMs).length)
-    : null
+  onMount(() => { load(); stopPolling = startPolling(load) })
+  onDestroy(() => stopPolling?.())
 
   $: openIncidents = incidents.filter(i => !i.resolvedAt).length
   $: tags = monitor ? parseTags(monitor.tags) : []
@@ -142,8 +132,8 @@
   $: headerCount = (() => { try { return Object.keys(JSON.parse(monitor?.headers ?? '{}')).length } catch { return 0 } })()
   $: protocol = monitor?.url?.startsWith('https://') ? 'HTTPS' : monitor?.url?.startsWith('http://') ? 'HTTP' : ''
 
-  $: totalLogPages = Math.max(1, Math.ceil(recentLogs.length / 20))
-  $: pagedLogs = recentLogs.slice(logsPage * 20, (logsPage + 1) * 20)
+  $: totalLogPages = Math.max(1, Math.ceil(logs.length / 20))
+  $: pagedLogs = logs.slice(logsPage * 20, (logsPage + 1) * 20)
   $: { if (logsPage >= totalLogPages) logsPage = Math.max(0, totalLogPages - 1) }
 </script>
 
@@ -349,13 +339,13 @@
     <div class="card">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-sm font-semibold" style="color: rgb(var(--text))">{$t('monitor.recentChecks')}</h2>
-        {#if recentLogs.length > 0}
+        {#if logs.length > 0}
           <span class="text-xs" style="color: rgb(var(--text-muted))">
-            {logsPage * 20 + 1}–{Math.min((logsPage + 1) * 20, recentLogs.length)} / {recentLogs.length}
+            {logsPage * 20 + 1}–{Math.min((logsPage + 1) * 20, logs.length)} / {logs.length}
           </span>
         {/if}
       </div>
-      {#if recentLogs.length === 0}
+      {#if logs.length === 0}
         <p class="text-sm" style="color: rgb(var(--text-muted))">
           {$t('monitor.noLogs')} {monitor.lastStatus === 'pending' ? $t('monitor.noLogsPending') : ''}
         </p>

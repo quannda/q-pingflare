@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
   import { api } from '$lib/api'
+  import { startPolling } from '$lib/poll'
   import { monitors } from '$lib/stores'
   import { t, locale, nMonitors } from '$lib/i18n'
   import MonitorCard from '$lib/components/MonitorCard.svelte'
@@ -13,20 +14,15 @@
   let running = false
   let lastRun: Date | null = null
   let uptimes: Record<string, number | null> = {}
-  let ticker: ReturnType<typeof setInterval>
+  let stopPolling: () => void
 
   async function load() {
     try {
-      const list = await api.monitors.list()
+      // One request for the list and every monitor's uptime. This used to be
+      // 1 + N requests, each one aggregating over the full status log.
+      const { monitors: list, uptime30 } = await api.monitors.overview()
       monitors.set(list)
-      const results = await Promise.allSettled(
-        list.map(m => api.monitors.uptime(m.id, 30).then(r => [m.id, r.uptime] as [string, number | null]))
-      )
-      const map: Record<string, number | null> = {}
-      for (const r of results) {
-        if (r.status === 'fulfilled') map[r.value[0]] = r.value[1]
-      }
-      uptimes = map
+      uptimes = uptime30
       error = ''
     } catch (e) {
       error = String(e)
@@ -48,8 +44,8 @@
     }
   }
 
-  onMount(() => { load(); ticker = setInterval(load, 10_000) })
-  onDestroy(() => clearInterval(ticker))
+  onMount(() => { load(); stopPolling = startPolling(load) })
+  onDestroy(() => stopPolling?.())
 
   $: total   = $monitors.length
   $: up      = $monitors.filter(m => m.lastStatus === 'up').length

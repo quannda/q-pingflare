@@ -39,14 +39,26 @@ var import_better_sqlite3 = __toESM(require("better-sqlite3"));
 var import_node_path = __toESM(require("path"));
 var import_node_fs = __toESM(require("fs"));
 var ShimStatement = class _ShimStatement {
-  constructor(stmt, values = []) {
-    this.stmt = stmt;
+  constructor(db, sql3, values = []) {
+    this.db = db;
+    this.sql = sql3;
     this.values = values;
   }
-  stmt;
+  db;
+  sql;
   values;
+  cachedStmt;
+  /**
+   * Memoised. This used to re-prepare on every access, which silently broke
+   * raw(): the `raw(true)` flag was set on a throwaway statement and the
+   * subsequent all() ran on a fresh one that still returned objects. Drizzle maps
+   * those rows positionally, so every read came back empty.
+   */
+  get stmt() {
+    return this.cachedStmt ??= this.db.prepare(this.sql);
+  }
   bind(...args) {
-    return new _ShimStatement(this.stmt, args);
+    return new _ShimStatement(this.db, this.sql, args);
   }
   async first(colName) {
     const result = this.values.length ? this.stmt.get(...this.values) : this.stmt.get();
@@ -76,14 +88,18 @@ var ShimStatement = class _ShimStatement {
     return { results, success: true, meta: {} };
   }
   async raw(options) {
-    this.stmt.raw(true);
-    const rows = this.values.length ? this.stmt.all(...this.values) : this.stmt.all();
-    this.stmt.raw(false);
-    if (options?.columnNames) {
-      const cols = this.stmt.columns().map((c) => c.name);
-      return [cols, ...rows];
+    const stmt = this.stmt;
+    stmt.raw(true);
+    try {
+      const rows = this.values.length ? stmt.all(...this.values) : stmt.all();
+      if (options?.columnNames) {
+        const cols = stmt.columns().map((c) => c.name);
+        return [cols, ...rows];
+      }
+      return rows;
+    } finally {
+      stmt.raw(false);
     }
-    return rows;
   }
   _execSync() {
     this.values.length ? this.stmt.run(...this.values) : this.stmt.run();
@@ -94,8 +110,8 @@ var D1Shim = class {
     this.db = db;
   }
   db;
-  prepare(sql2) {
-    return new ShimStatement(this.db.prepare(sql2));
+  prepare(sql3) {
+    return new ShimStatement(this.db, sql3);
   }
   async batch(stmts) {
     const results = [];
@@ -108,8 +124,8 @@ var D1Shim = class {
     runAll();
     return results;
   }
-  async exec(sql2) {
-    this.db.exec(sql2);
+  async exec(sql3) {
+    this.db.exec(sql3);
     return { count: 0, duration: 0 };
   }
   async dump() {
@@ -126,6 +142,7 @@ function openSqlite(dbPath) {
 }
 
 // src/db/migrate.ts
+var SCHEMA_VERSION = 2;
 var migrated = false;
 var SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS monitors (
@@ -269,9 +286,57 @@ CREATE TABLE IF NOT EXISTS incident_monitors (
   FOREIGN KEY (incident_id) REFERENCES incident_reports(id) ON UPDATE no action ON DELETE cascade,
   FOREIGN KEY (monitor_id) REFERENCES monitors(id) ON UPDATE no action ON DELETE cascade
 );
+
+CREATE TABLE IF NOT EXISTS daily_stats (
+  monitor_id text NOT NULL,
+  day integer NOT NULL,
+  total integer DEFAULT 0 NOT NULL,
+  ups integer DEFAULT 0 NOT NULL,
+  rt_sum integer DEFAULT 0 NOT NULL,
+  rt_count integer DEFAULT 0 NOT NULL,
+  PRIMARY KEY(monitor_id, day),
+  FOREIGN KEY (monitor_id) REFERENCES monitors(id) ON UPDATE no action ON DELETE cascade
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_status_logs_monitor_checked ON status_logs (monitor_id, checked_at);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_monitor_started ON incidents (monitor_id, started_at);
+
+CREATE INDEX IF NOT EXISTS idx_incident_monitors_monitor ON incident_monitors (monitor_id);
+
+INSERT OR IGNORE INTO settings (key, value) VALUES ('stats_retention_days', '400');
+
+INSERT OR IGNORE INTO settings (key, value) VALUES ('cache_ttl', '900');
 `;
+async function rebuildDailyStats(d1) {
+  await d1.prepare(`
+    INSERT INTO daily_stats (monitor_id, day, total, ups, rt_sum, rt_count)
+    SELECT
+      monitor_id,
+      checked_at / 86400,
+      COUNT(*),
+      SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END),
+      COALESCE(SUM(response_time_ms), 0),
+      COUNT(response_time_ms)
+    FROM status_logs
+    GROUP BY monitor_id, checked_at / 86400
+    ON CONFLICT (monitor_id, day) DO UPDATE SET
+      total = excluded.total,
+      ups = excluded.ups,
+      rt_sum = excluded.rt_sum,
+      rt_count = excluded.rt_count
+  `).run();
+}
 async function ensureSchema(d1) {
   if (migrated) return;
+  try {
+    const row = await d1.prepare(`SELECT value FROM settings WHERE key = 'schema_version'`).first();
+    if (row && Number(row.value) >= SCHEMA_VERSION) {
+      migrated = true;
+      return;
+    }
+  } catch {
+  }
   const statements = SCHEMA_SQL.split(";").map((s2) => s2.trim()).filter((s2) => s2.length > 0);
   await d1.batch(statements.map((s2) => d1.prepare(s2)));
   const alterStatements = [
@@ -284,17 +349,23 @@ async function ensureSchema(d1) {
     `ALTER TABLE status_logs ADD COLUMN country_code text`,
     `ALTER TABLE status_logs ADD COLUMN origin_ip text`
   ];
-  for (const sql2 of alterStatements) {
+  for (const sql3 of alterStatements) {
     try {
-      await d1.prepare(sql2).run();
+      await d1.prepare(sql3).run();
     } catch {
     }
   }
+  await d1.prepare(`INSERT INTO settings (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).bind(String(SCHEMA_VERSION)).run();
   migrated = true;
+  try {
+    await rebuildDailyStats(d1);
+  } catch (err) {
+    console.error("[migrate] daily_stats backfill failed, run POST /api/settings/rebuild-stats", err);
+  }
 }
 
 // src/cron.ts
-var import_drizzle_orm3 = require("drizzle-orm");
+var import_drizzle_orm4 = require("drizzle-orm");
 
 // src/db/index.ts
 var import_d1 = require("drizzle-orm/d1");
@@ -303,6 +374,7 @@ var import_d1 = require("drizzle-orm/d1");
 var schema_exports = {};
 __export(schema_exports, {
   alertState: () => alertState,
+  dailyStats: () => dailyStats,
   heartbeatTokens: () => heartbeatTokens,
   incidentMonitors: () => incidentMonitors,
   incidentReports: () => incidentReports,
@@ -361,14 +433,28 @@ var statusLogs = (0, import_sqlite_core.sqliteTable)("status_logs", {
   colo: (0, import_sqlite_core.text)("colo"),
   countryCode: (0, import_sqlite_core.text)("country_code"),
   originIp: (0, import_sqlite_core.text)("origin_ip")
-});
+}, (t) => [
+  // Every hot query filters by (monitor_id, checked_at). Without this every read
+  // is a full table scan. Deliberately the ONLY secondary index on this table:
+  // D1 bills each index entry as a row written, so each extra index costs one
+  // extra write per check.
+  (0, import_sqlite_core.index)("idx_status_logs_monitor_checked").on(t.monitorId, t.checkedAt)
+]);
+var dailyStats = (0, import_sqlite_core.sqliteTable)("daily_stats", {
+  monitorId: (0, import_sqlite_core.text)("monitor_id").notNull().references(() => monitors.id, { onDelete: "cascade" }),
+  day: (0, import_sqlite_core.integer)("day").notNull(),
+  total: (0, import_sqlite_core.integer)("total").notNull().default(0),
+  ups: (0, import_sqlite_core.integer)("ups").notNull().default(0),
+  rtSum: (0, import_sqlite_core.integer)("rt_sum").notNull().default(0),
+  rtCount: (0, import_sqlite_core.integer)("rt_count").notNull().default(0)
+}, (t) => [(0, import_sqlite_core.primaryKey)({ columns: [t.monitorId, t.day] })]);
 var incidents = (0, import_sqlite_core.sqliteTable)("incidents", {
   id: (0, import_sqlite_core.text)("id").primaryKey(),
   monitorId: (0, import_sqlite_core.text)("monitor_id").notNull().references(() => monitors.id, { onDelete: "cascade" }),
   startedAt: (0, import_sqlite_core.integer)("started_at").notNull(),
   resolvedAt: (0, import_sqlite_core.integer)("resolved_at"),
   durationSeconds: (0, import_sqlite_core.integer)("duration_seconds")
-});
+}, (t) => [(0, import_sqlite_core.index)("idx_incidents_monitor_started").on(t.monitorId, t.startedAt)]);
 var notificationChannels = (0, import_sqlite_core.sqliteTable)("notification_channels", {
   id: (0, import_sqlite_core.text)("id").primaryKey(),
   name: (0, import_sqlite_core.text)("name").notNull(),
@@ -431,7 +517,10 @@ var incidentUpdates = (0, import_sqlite_core.sqliteTable)("incident_updates", {
 var incidentMonitors = (0, import_sqlite_core.sqliteTable)("incident_monitors", {
   incidentId: (0, import_sqlite_core.text)("incident_id").notNull().references(() => incidentReports.id, { onDelete: "cascade" }),
   monitorId: (0, import_sqlite_core.text)("monitor_id").notNull().references(() => monitors.id, { onDelete: "cascade" })
-}, (t) => [(0, import_sqlite_core.primaryKey)({ columns: [t.incidentId, t.monitorId] })]);
+}, (t) => [
+  (0, import_sqlite_core.primaryKey)({ columns: [t.incidentId, t.monitorId] }),
+  (0, import_sqlite_core.index)("idx_incident_monitors_monitor").on(t.monitorId)
+]);
 
 // src/db/index.ts
 function getDb(d1) {
@@ -1734,8 +1823,9 @@ async function processAlert(ctx) {
       surgePausedUntil: null
     };
   }
-  const channels = await getChannels(db, monitor.id);
-  const locale = await getLocale(db);
+  let channelsCache = null;
+  const channels = async () => channelsCache ??= await getChannels(db, monitor.id);
+  const locale = ctx.locale ?? await getLocale(db);
   const prevStatus = monitor.lastStatus;
   if (status === "down") {
     const newFailures = (monitor.type === "heartbeat" ? state.consecutiveMissed : state.consecutiveFailures) + 1;
@@ -1764,7 +1854,7 @@ async function processAlert(ctx) {
         responseTimeMs,
         locale
       };
-      await dispatchToChannels(channels, payload, encryptionKey);
+      await dispatchToChannels(await channels(), payload, encryptionKey);
       await db.update(alertState).set({ alertSentAt: now, consecutiveAlerts: (state.consecutiveAlerts ?? 0) + 1, lastReminderAt: now }).where((0, import_drizzle_orm2.eq)(alertState.monitorId, monitor.id));
       const limit = monitor.surgeProtectionLimit;
       if (limit && state.consecutiveAlerts + 1 >= limit) {
@@ -1785,21 +1875,23 @@ async function processAlert(ctx) {
             incidentStartedAt: incident?.startedAt,
             locale
           };
-          await dispatchToChannels(channels, payload, encryptionKey);
+          await dispatchToChannels(await channels(), payload, encryptionKey);
           await db.update(alertState).set({ lastReminderAt: now }).where((0, import_drizzle_orm2.eq)(alertState.monitorId, monitor.id));
         }
       }
     }
   } else {
     const wasDown = prevStatus === "down";
-    await db.update(alertState).set({
-      consecutiveFailures: 0,
-      consecutiveMissed: 0,
-      alertSentAt: null,
-      consecutiveAlerts: 0,
-      lastReminderAt: null,
-      surgePausedUntil: null
-    }).where((0, import_drizzle_orm2.eq)(alertState.monitorId, monitor.id));
+    if (isDirty(state)) {
+      await db.update(alertState).set({
+        consecutiveFailures: 0,
+        consecutiveMissed: 0,
+        alertSentAt: null,
+        consecutiveAlerts: 0,
+        lastReminderAt: null,
+        surgePausedUntil: null
+      }).where((0, import_drizzle_orm2.eq)(alertState.monitorId, monitor.id));
+    }
     const orphanedIncident = !wasDown ? await getOpenIncident(db, monitor.id) : null;
     if (wasDown || orphanedIncident) {
       await closeIncident(db, monitor.id, now);
@@ -1811,10 +1903,13 @@ async function processAlert(ctx) {
         responseTimeMs,
         locale
       };
-      await dispatchToChannels(channels, payload, encryptionKey);
+      await dispatchToChannels(await channels(), payload, encryptionKey);
     }
     await updateMonitorStatus(db, monitor.id, "up", now);
   }
+}
+function isDirty(state) {
+  return state.consecutiveFailures !== 0 || state.consecutiveMissed !== 0 || state.alertSentAt !== null || state.consecutiveAlerts !== 0 || state.lastReminderAt !== null || state.surgePausedUntil !== null;
 }
 async function getChannels(db, monitorId) {
   const rows = await db.select({ channel: notificationChannels }).from(monitorNotifications).innerJoin(notificationChannels, (0, import_drizzle_orm2.eq)(monitorNotifications.channelId, notificationChannels.id)).where((0, import_drizzle_orm2.eq)(monitorNotifications.monitorId, monitorId));
@@ -1835,7 +1930,7 @@ async function openIncident(db, monitorId, now) {
 }
 async function getOpenIncident(db, monitorId) {
   return db.query.incidents.findFirst({
-    where: (i, { and: and3, eq: eq10, isNull }) => and3(eq10(i.monitorId, monitorId), isNull(i.resolvedAt))
+    where: (i, { and: and5, eq: eq11, isNull }) => and5(eq11(i.monitorId, monitorId), isNull(i.resolvedAt))
   });
 }
 async function closeIncident(db, monitorId, now) {
@@ -1847,6 +1942,175 @@ async function getLocale(db) {
   const row = await db.query.settings.findFirst({ where: (0, import_drizzle_orm2.eq)(settings.key, "locale") });
   return row?.value ?? "en";
 }
+
+// src/services/stats.ts
+var import_drizzle_orm3 = require("drizzle-orm");
+var SECONDS_PER_DAY = 86400;
+function dayOf(unixSeconds) {
+  return Math.floor(unixSeconds / SECONDS_PER_DAY);
+}
+function dayToDate(day) {
+  return new Date(day * SECONDS_PER_DAY * 1e3).toISOString().slice(0, 10);
+}
+async function loadSettings(db) {
+  const rows = await db.select().from(settings);
+  const out = {};
+  for (const row of rows) out[row.key] = row.value;
+  return out;
+}
+function toUptime(total, ups) {
+  return { total, ups, uptime: total > 0 ? Math.round(ups / total * 1e4) / 100 : null };
+}
+async function uptimeFromLogs(db, monitorId, sinceTs) {
+  const [row] = await db.select({
+    total: import_drizzle_orm3.sql`COUNT(*)`,
+    ups: import_drizzle_orm3.sql`COALESCE(SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END), 0)`
+  }).from(statusLogs).where((0, import_drizzle_orm3.and)((0, import_drizzle_orm3.eq)(statusLogs.monitorId, monitorId), (0, import_drizzle_orm3.gte)(statusLogs.checkedAt, sinceTs)));
+  return toUptime(Number(row?.total ?? 0), Number(row?.ups ?? 0));
+}
+async function uptimeFromStats(db, monitorId, sinceDay) {
+  const [row] = await db.select({
+    total: import_drizzle_orm3.sql`COALESCE(SUM(total), 0)`,
+    ups: import_drizzle_orm3.sql`COALESCE(SUM(ups), 0)`
+  }).from(dailyStats).where((0, import_drizzle_orm3.and)((0, import_drizzle_orm3.eq)(dailyStats.monitorId, monitorId), (0, import_drizzle_orm3.gte)(dailyStats.day, sinceDay)));
+  return toUptime(Number(row?.total ?? 0), Number(row?.ups ?? 0));
+}
+async function uptimeForDays(db, monitorId, days, now) {
+  if (days <= 2) return uptimeFromLogs(db, monitorId, now - days * SECONDS_PER_DAY);
+  return uptimeFromStats(db, monitorId, dayOf(now) - (days - 1));
+}
+async function dailySeries(db, monitorId, days, now) {
+  const today = dayOf(now);
+  const fromDay = today - (days - 1);
+  const rows = await db.select({
+    day: dailyStats.day,
+    total: dailyStats.total,
+    ups: dailyStats.ups
+  }).from(dailyStats).where((0, import_drizzle_orm3.and)((0, import_drizzle_orm3.eq)(dailyStats.monitorId, monitorId), (0, import_drizzle_orm3.gte)(dailyStats.day, fromDay)));
+  return fillDays(rows, fromDay, today);
+}
+function fillDays(rows, fromDay, today) {
+  const byDay = new Map(rows.map((r) => [r.day, r]));
+  const out = [];
+  for (let d = fromDay; d <= today; d++) {
+    const row = byDay.get(d);
+    out.push({
+      date: dayToDate(d),
+      uptime: row && row.total > 0 ? Math.round(row.ups / row.total * 1e3) / 10 : null
+    });
+  }
+  return out;
+}
+async function dailySeriesBulk(db, monitorIds, days, now) {
+  const today = dayOf(now);
+  const fromDay = today - (days - 1);
+  const out = /* @__PURE__ */ new Map();
+  if (monitorIds.length === 0) return out;
+  const rows = await db.select({
+    monitorId: dailyStats.monitorId,
+    day: dailyStats.day,
+    total: dailyStats.total,
+    ups: dailyStats.ups
+  }).from(dailyStats).where((0, import_drizzle_orm3.and)((0, import_drizzle_orm3.inArray)(dailyStats.monitorId, monitorIds), (0, import_drizzle_orm3.gte)(dailyStats.day, fromDay)));
+  const grouped = /* @__PURE__ */ new Map();
+  for (const row of rows) {
+    const list = grouped.get(row.monitorId) ?? [];
+    list.push(row);
+    grouped.set(row.monitorId, list);
+  }
+  for (const id of monitorIds) {
+    out.set(id, fillDays(grouped.get(id) ?? [], fromDay, today));
+  }
+  return out;
+}
+async function uptimeBulk(db, monitorIds, days, now) {
+  const out = /* @__PURE__ */ new Map();
+  if (monitorIds.length === 0) return out;
+  const rows = await db.select({
+    monitorId: dailyStats.monitorId,
+    total: import_drizzle_orm3.sql`COALESCE(SUM(total), 0)`,
+    ups: import_drizzle_orm3.sql`COALESCE(SUM(ups), 0)`
+  }).from(dailyStats).where((0, import_drizzle_orm3.and)((0, import_drizzle_orm3.inArray)(dailyStats.monitorId, monitorIds), (0, import_drizzle_orm3.gte)(dailyStats.day, dayOf(now) - (days - 1)))).groupBy(dailyStats.monitorId);
+  for (const row of rows) {
+    out.set(row.monitorId, toUptime(Number(row.total), Number(row.ups)));
+  }
+  for (const id of monitorIds) {
+    if (!out.has(id)) out.set(id, toUptime(0, 0));
+  }
+  return out;
+}
+async function checkCount(db, monitorId) {
+  const [row] = await db.select({ total: import_drizzle_orm3.sql`COALESCE(SUM(total), 0)` }).from(dailyStats).where((0, import_drizzle_orm3.eq)(dailyStats.monitorId, monitorId));
+  return Number(row?.total ?? 0);
+}
+async function avgResponseMs(db, monitorId, sinceTs) {
+  const [row] = await db.select({ avg: import_drizzle_orm3.sql`AVG(response_time_ms)` }).from(statusLogs).where((0, import_drizzle_orm3.and)((0, import_drizzle_orm3.eq)(statusLogs.monitorId, monitorId), (0, import_drizzle_orm3.gte)(statusLogs.checkedAt, sinceTs)));
+  return row?.avg == null ? null : Math.round(Number(row.avg));
+}
+async function recordCheck(db, monitorId, checkedAt, status, responseTimeMs) {
+  const isUp = status === "up" ? 1 : 0;
+  const rt = responseTimeMs ?? 0;
+  const hasRt = responseTimeMs == null ? 0 : 1;
+  await db.insert(dailyStats).values({
+    monitorId,
+    day: dayOf(checkedAt),
+    total: 1,
+    ups: isUp,
+    rtSum: rt,
+    rtCount: hasRt
+  }).onConflictDoUpdate({
+    target: [dailyStats.monitorId, dailyStats.day],
+    set: {
+      total: import_drizzle_orm3.sql`total + 1`,
+      ups: import_drizzle_orm3.sql`ups + ${isUp}`,
+      rtSum: import_drizzle_orm3.sql`rt_sum + ${rt}`,
+      rtCount: import_drizzle_orm3.sql`rt_count + ${hasRt}`
+    }
+  });
+}
+async function pruneDailyStats(db, beforeDay) {
+  await db.delete(dailyStats).where((0, import_drizzle_orm3.lt)(dailyStats.day, beforeDay));
+}
+
+// src/cache.ts
+var MIN_TTL = 60;
+var DEFAULT_TTL = 900;
+function cacheTtl(settings2) {
+  const raw = Number(settings2["cache_ttl"]);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_TTL;
+  return Math.max(MIN_TTL, Math.floor(raw));
+}
+async function cached(env, key, ttlSeconds, compute) {
+  const kv = env.CACHE;
+  if (!kv) return compute();
+  try {
+    const hit = await kv.get(key, "json");
+    if (hit !== null) return hit;
+  } catch (err) {
+    console.error("[cache] read failed", key, err);
+  }
+  const value = await compute();
+  try {
+    await kv.put(key, JSON.stringify(value), {
+      expirationTtl: Math.max(MIN_TTL, ttlSeconds)
+    });
+  } catch (err) {
+    console.error("[cache] write failed", key, err);
+  }
+  return value;
+}
+async function invalidate(env, ...keys) {
+  const kv = env.CACHE;
+  if (!kv || keys.length === 0) return;
+  await Promise.allSettled(keys.map((k) => kv.delete(k).catch(() => {
+  })));
+}
+var cacheKeys = {
+  overview: () => "agg:v1:overview",
+  monitor: (id) => `agg:v1:monitor:${id}`,
+  publicPage: (slug) => `agg:v1:public:${slug}`,
+  publicMonitor: (slug, monitorId) => `agg:v1:public:${slug}:${monitorId}`
+};
 
 // src/cron.ts
 async function getWorkerOrigin() {
@@ -1862,39 +2126,60 @@ async function getWorkerOrigin() {
     return null;
   }
 }
+function intSetting(all, key, fallback) {
+  const n = Number(all[key]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+async function runRetention(db, all, now) {
+  const lastRun = Number(all["last_cleanup_at"] ?? 0);
+  if (Number.isFinite(lastRun) && now - lastRun < SECONDS_PER_DAY) return;
+  await db.insert(settings).values({ key: "last_cleanup_at", value: String(now) }).onConflictDoUpdate({ target: settings.key, set: { value: String(now) } });
+  const ids = await db.select({ id: monitors.id }).from(monitors);
+  const logCutoff = now - intSetting(all, "retention_days", 90) * SECONDS_PER_DAY;
+  for (const { id } of ids) {
+    await db.delete(statusLogs).where((0, import_drizzle_orm4.and)((0, import_drizzle_orm4.eq)(statusLogs.monitorId, id), (0, import_drizzle_orm4.lt)(statusLogs.checkedAt, logCutoff)));
+  }
+  await pruneDailyStats(db, dayOf(now) - intSetting(all, "stats_retention_days", 400));
+}
 async function runCron(env) {
   const db = getDb(env.DB);
   const now = Math.floor(Date.now() / 1e3);
-  const origin = await getWorkerOrigin();
-  const allMonitors = await db.select().from(monitors).where((0, import_drizzle_orm3.eq)(monitors.active, true));
+  const allSettings = await loadSettings(db);
+  const locale = allSettings["locale"] ?? "en";
+  await runRetention(db, allSettings, now);
+  const allMonitors = await db.select().from(monitors).where((0, import_drizzle_orm4.eq)(monitors.active, true));
   const due = allMonitors.filter((m) => {
     if (!m.lastCheckedAt) return true;
     return now - m.lastCheckedAt >= m.interval;
   });
-  const retentionRow = await db.select().from(settings).where((0, import_drizzle_orm3.eq)(settings.key, "retention_days")).get();
-  const retentionDays = retentionRow ? parseInt(retentionRow.value, 10) : 90;
-  const cutoff = now - retentionDays * 86400;
-  await db.delete(statusLogs).where((0, import_drizzle_orm3.lt)(statusLogs.checkedAt, cutoff));
   if (due.length === 0) return;
-  const locale = await getLocale(db);
+  const origin = await getWorkerOrigin();
+  const transitioned = [];
   await Promise.allSettled(due.map(async (monitor) => {
+    const logRow = {
+      id: crypto.randomUUID(),
+      monitorId: monitor.id,
+      checkedAt: now,
+      colo: origin?.colo ?? null,
+      countryCode: origin?.countryCode ?? null,
+      originIp: origin?.originIp ?? null
+    };
     try {
       if (monitor.type === "http") {
         const result = await checkHttp(monitor, locale);
         await db.insert(statusLogs).values({
-          id: crypto.randomUUID(),
-          monitorId: monitor.id,
+          ...logRow,
           status: result.status,
           message: result.message,
-          responseTimeMs: result.responseTimeMs,
-          checkedAt: now,
-          colo: origin?.colo ?? null,
-          countryCode: origin?.countryCode ?? null,
-          originIp: origin?.originIp ?? null
+          responseTimeMs: result.responseTimeMs
         });
+        await recordCheck(db, monitor.id, now, result.status, result.responseTimeMs ?? null);
+        if (monitor.lastStatus !== result.status) transitioned.push(monitor.id);
         if (monitor.sslCheckEnabled && monitor.url?.startsWith("https://")) {
           const newSslStatus = result.sslError ? "error" : result.status === "up" ? "ok" : monitor.sslStatus;
-          await db.update(monitors).set({ sslStatus: newSslStatus }).where((0, import_drizzle_orm3.eq)(monitors.id, monitor.id));
+          if (newSslStatus !== monitor.sslStatus) {
+            await db.update(monitors).set({ sslStatus: newSslStatus }).where((0, import_drizzle_orm4.eq)(monitors.id, monitor.id));
+          }
         }
         await processAlert({
           db,
@@ -1902,47 +2187,59 @@ async function runCron(env) {
           status: result.status,
           message: result.message,
           responseTimeMs: result.responseTimeMs,
+          locale,
           encryptionKey: env.ENCRYPTION_KEY
         });
       } else if (monitor.type === "heartbeat") {
         const hb = await db.query.heartbeatTokens.findFirst({
-          where: (0, import_drizzle_orm3.eq)(heartbeatTokens.monitorId, monitor.id)
+          where: (0, import_drizzle_orm4.eq)(heartbeatTokens.monitorId, monitor.id)
         });
         const result = checkHeartbeat(monitor, hb?.lastPingAt ?? null, now, locale);
         await db.insert(statusLogs).values({
-          id: crypto.randomUUID(),
-          monitorId: monitor.id,
+          ...logRow,
           status: result.status,
           message: result.logKey ?? result.message,
-          responseTimeMs: null,
-          checkedAt: now,
-          colo: origin?.colo ?? null,
-          countryCode: origin?.countryCode ?? null,
-          originIp: origin?.originIp ?? null
+          responseTimeMs: null
         });
+        await recordCheck(db, monitor.id, now, result.status, null);
+        if (monitor.lastStatus !== result.status) transitioned.push(monitor.id);
         await processAlert({
           db,
           monitor,
           status: result.status,
           message: result.message,
+          locale,
           encryptionKey: env.ENCRYPTION_KEY
         });
       }
     } catch (err) {
       await db.insert(statusLogs).values({
-        id: crypto.randomUUID(),
-        monitorId: monitor.id,
+        ...logRow,
         status: "down",
         message: `Internal error: ${String(err)}`,
-        responseTimeMs: null,
-        checkedAt: now,
-        colo: origin?.colo ?? null,
-        countryCode: origin?.countryCode ?? null,
-        originIp: origin?.originIp ?? null
+        responseTimeMs: null
       }).catch(() => {
+      });
+      await recordCheck(db, monitor.id, now, "down", null).catch(() => {
       });
     }
   }));
+  if (transitioned.length > 0) {
+    await invalidate(env, cacheKeys.overview(), ...transitioned.map(cacheKeys.monitor));
+    await invalidatePublicPages(db, env, transitioned);
+  }
+}
+async function invalidatePublicPages(db, env, monitorIds) {
+  try {
+    const pages = await db.select({ slug: statusPages.slug }).from(statusPages);
+    const keys = pages.flatMap((p) => [
+      cacheKeys.publicPage(p.slug),
+      ...monitorIds.map((id) => cacheKeys.publicMonitor(p.slug, id))
+    ]);
+    await invalidate(env, ...keys);
+  } catch (err) {
+    console.error("[cron] status page cache invalidation failed", err);
+  }
 }
 
 // src/middleware/auth.ts
@@ -1998,7 +2295,7 @@ var auth_default = auth;
 
 // src/routes/monitors.ts
 var import_hono2 = require("hono");
-var import_drizzle_orm4 = require("drizzle-orm");
+var import_drizzle_orm5 = require("drizzle-orm");
 var router = new import_hono2.Hono();
 router.use("*", requireAuth);
 router.get("/", async (c) => {
@@ -2006,10 +2303,27 @@ router.get("/", async (c) => {
   const rows = await db.select().from(monitors);
   return c.json(rows);
 });
+router.get("/overview", async (c) => {
+  const db = getDb(c.env.DB);
+  const now = Math.floor(Date.now() / 1e3);
+  const [rows, allSettings] = await Promise.all([
+    db.select().from(monitors),
+    loadSettings(db)
+  ]);
+  const ids = rows.map((r) => r.id);
+  const uptime = await cached(c.env, cacheKeys.overview(), cacheTtl(allSettings), async () => {
+    const totals = await uptimeBulk(db, ids, 30, now);
+    return Object.fromEntries([...totals].map(([id, t]) => [id, t.uptime]));
+  });
+  return c.json({
+    monitors: rows,
+    uptime30: uptime
+  });
+});
 router.get("/:id", async (c) => {
   const db = getDb(c.env.DB);
   const monitor = await db.query.monitors.findFirst({
-    where: (0, import_drizzle_orm4.eq)(monitors.id, c.req.param("id"))
+    where: (0, import_drizzle_orm5.eq)(monitors.id, c.req.param("id"))
   });
   if (!monitor) return c.json({ error: "Not found" }, 404);
   return c.json(monitor);
@@ -2062,7 +2376,8 @@ router.post("/", async (c) => {
       await db.insert(monitorNotifications).values({ monitorId: id, channelId });
     }
   }
-  const created = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm4.eq)(monitors.id, id) });
+  await invalidate(c.env, cacheKeys.overview());
+  const created = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm5.eq)(monitors.id, id) });
   return c.json(created, 201);
 });
 router.put("/:id", async (c) => {
@@ -2070,7 +2385,7 @@ router.put("/:id", async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json();
   const now = Math.floor(Date.now() / 1e3);
-  const existing = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm4.eq)(monitors.id, id) });
+  const existing = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm5.eq)(monitors.id, id) });
   if (!existing) return c.json({ error: "Not found" }, 404);
   await db.update(monitors).set({
     name: body.name ?? existing.name,
@@ -2098,26 +2413,27 @@ router.put("/:id", async (c) => {
     sslCheckEnabled: body.sslCheckEnabled ?? existing.sslCheckEnabled,
     cacheBooster: body.cacheBooster ?? existing.cacheBooster,
     updatedAt: now
-  }).where((0, import_drizzle_orm4.eq)(monitors.id, id));
+  }).where((0, import_drizzle_orm5.eq)(monitors.id, id));
   if (Array.isArray(body.channelIds)) {
-    await db.delete(monitorNotifications).where((0, import_drizzle_orm4.eq)(monitorNotifications.monitorId, id));
+    await db.delete(monitorNotifications).where((0, import_drizzle_orm5.eq)(monitorNotifications.monitorId, id));
     for (const channelId of body.channelIds) {
       await db.insert(monitorNotifications).values({ monitorId: id, channelId });
     }
   }
-  const updated = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm4.eq)(monitors.id, id) });
+  const updated = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm5.eq)(monitors.id, id) });
   return c.json(updated);
 });
 router.delete("/:id", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
-  await db.delete(monitors).where((0, import_drizzle_orm4.eq)(monitors.id, id));
+  await db.delete(monitors).where((0, import_drizzle_orm5.eq)(monitors.id, id));
+  await invalidate(c.env, cacheKeys.overview(), cacheKeys.monitor(id));
   return c.json({ ok: true });
 });
 router.get("/:id/heartbeat-token", async (c) => {
   const db = getDb(c.env.DB);
   const token = await db.query.heartbeatTokens.findFirst({
-    where: (0, import_drizzle_orm4.eq)(heartbeatTokens.monitorId, c.req.param("id"))
+    where: (0, import_drizzle_orm5.eq)(heartbeatTokens.monitorId, c.req.param("id"))
   });
   if (!token) return c.json({ error: "Not a heartbeat monitor" }, 404);
   return c.json(token);
@@ -2126,16 +2442,17 @@ router.post("/:id/heartbeat-token/regenerate", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
   const newToken = crypto.randomUUID();
-  await db.update(heartbeatTokens).set({ token: newToken }).where((0, import_drizzle_orm4.eq)(heartbeatTokens.monitorId, id));
+  await db.update(heartbeatTokens).set({ token: newToken }).where((0, import_drizzle_orm5.eq)(heartbeatTokens.monitorId, id));
   return c.json({ token: newToken });
 });
 router.post("/:id/reset-stats", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
-  const monitor = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm4.eq)(monitors.id, id) });
+  const monitor = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm5.eq)(monitors.id, id) });
   if (!monitor) return c.json({ error: "Not found" }, 404);
-  await db.delete(statusLogs).where((0, import_drizzle_orm4.eq)(statusLogs.monitorId, id));
-  await db.delete(incidents).where((0, import_drizzle_orm4.eq)(incidents.monitorId, id));
+  await db.delete(statusLogs).where((0, import_drizzle_orm5.eq)(statusLogs.monitorId, id));
+  await db.delete(dailyStats).where((0, import_drizzle_orm5.eq)(dailyStats.monitorId, id));
+  await db.delete(incidents).where((0, import_drizzle_orm5.eq)(incidents.monitorId, id));
   await db.update(alertState).set({
     consecutiveFailures: 0,
     consecutiveMissed: 0,
@@ -2143,39 +2460,40 @@ router.post("/:id/reset-stats", async (c) => {
     consecutiveAlerts: 0,
     lastReminderAt: null,
     surgePausedUntil: null
-  }).where((0, import_drizzle_orm4.eq)(alertState.monitorId, id));
+  }).where((0, import_drizzle_orm5.eq)(alertState.monitorId, id));
   await db.update(monitors).set({
     lastStatus: "pending",
     lastCheckedAt: null
-  }).where((0, import_drizzle_orm4.eq)(monitors.id, id));
+  }).where((0, import_drizzle_orm5.eq)(monitors.id, id));
+  await invalidate(c.env, cacheKeys.overview(), cacheKeys.monitor(id));
   return c.json({ ok: true });
 });
 router.get("/:id/channels", async (c) => {
   const db = getDb(c.env.DB);
-  const rows = await db.select().from(monitorNotifications).where((0, import_drizzle_orm4.eq)(monitorNotifications.monitorId, c.req.param("id")));
+  const rows = await db.select().from(monitorNotifications).where((0, import_drizzle_orm5.eq)(monitorNotifications.monitorId, c.req.param("id")));
   return c.json(rows.map((r) => r.channelId));
 });
 var monitors_default = router;
 
 // src/routes/heartbeat.ts
 var import_hono3 = require("hono");
-var import_drizzle_orm5 = require("drizzle-orm");
+var import_drizzle_orm6 = require("drizzle-orm");
 var router2 = new import_hono3.Hono();
 async function handleHeartbeat(c) {
   const db = getDb(c.env.DB);
   const token = c.req.param("token");
   const now = Math.floor(Date.now() / 1e3);
   const hb = await db.query.heartbeatTokens.findFirst({
-    where: (0, import_drizzle_orm5.eq)(heartbeatTokens.token, token)
+    where: (0, import_drizzle_orm6.eq)(heartbeatTokens.token, token)
   });
   if (!hb) return c.json({ error: "Unknown heartbeat token" }, 404);
   const monitor = await db.query.monitors.findFirst({
-    where: (0, import_drizzle_orm5.eq)(monitors.id, hb.monitorId)
+    where: (0, import_drizzle_orm6.eq)(monitors.id, hb.monitorId)
   });
   if (!monitor || !monitor.active) return c.json({ error: "Monitor not active" }, 400);
   const locale = await getLocale(db);
   const receivedMsg = msgHeartbeatReceived(locale);
-  await db.update(heartbeatTokens).set({ lastPingAt: now }).where((0, import_drizzle_orm5.eq)(heartbeatTokens.token, token));
+  await db.update(heartbeatTokens).set({ lastPingAt: now }).where((0, import_drizzle_orm6.eq)(heartbeatTokens.token, token));
   await db.insert(statusLogs).values({
     id: crypto.randomUUID(),
     monitorId: monitor.id,
@@ -2184,8 +2502,11 @@ async function handleHeartbeat(c) {
     responseTimeMs: null,
     checkedAt: now
   });
-  await processAlert({ db, monitor, status: "up", message: receivedMsg });
-  await db.update(alertState).set({ consecutiveMissed: 0, alertSentAt: null, consecutiveAlerts: 0, surgePausedUntil: null }).where((0, import_drizzle_orm5.eq)(alertState.monitorId, monitor.id));
+  await recordCheck(db, monitor.id, now, "up", null);
+  await processAlert({ db, monitor, status: "up", message: receivedMsg, locale });
+  if (monitor.lastStatus !== "up") {
+    await invalidate(c.env, cacheKeys.overview(), cacheKeys.monitor(monitor.id));
+  }
   return new Response(null, {
     status: 200,
     headers: { "content-type": "application/json", "content-length": "0" }
@@ -2197,72 +2518,96 @@ var heartbeat_default = router2;
 
 // src/routes/history.ts
 var import_hono4 = require("hono");
-var import_drizzle_orm6 = require("drizzle-orm");
+var import_drizzle_orm7 = require("drizzle-orm");
 var router3 = new import_hono4.Hono();
 router3.use("*", requireAuth);
+var MAX_LOG_LIMIT = 1e3;
+var DEFAULT_SUMMARY_LOGS = 300;
+function clampLimit(raw, fallback) {
+  const n = Number(raw ?? fallback);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.floor(n), MAX_LOG_LIMIT);
+}
+function recentLogs(db, monitorId, limit, since) {
+  return db.select().from(statusLogs).where(since !== null ? (0, import_drizzle_orm7.and)((0, import_drizzle_orm7.eq)(statusLogs.monitorId, monitorId), (0, import_drizzle_orm7.gte)(statusLogs.checkedAt, since)) : (0, import_drizzle_orm7.eq)(statusLogs.monitorId, monitorId)).orderBy((0, import_drizzle_orm7.desc)(statusLogs.checkedAt)).limit(limit);
+}
+function monitorIncidents(db, monitorId, limit) {
+  return db.select().from(incidents).where((0, import_drizzle_orm7.eq)(incidents.monitorId, monitorId)).orderBy((0, import_drizzle_orm7.desc)(incidents.startedAt)).limit(limit);
+}
 router3.get("/:id/logs", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
   const hoursParam = c.req.query("hours");
   const hours = hoursParam !== void 0 ? Number(hoursParam) : null;
-  const limit = Number(c.req.query("limit") ?? 500);
+  const limit = clampLimit(c.req.query("limit"), 500);
   const since = hours !== null && hours > 0 ? Math.floor(Date.now() / 1e3) - hours * 3600 : null;
-  const rows = await db.select().from(statusLogs).where(since !== null ? (0, import_drizzle_orm6.and)((0, import_drizzle_orm6.eq)(statusLogs.monitorId, id), (0, import_drizzle_orm6.gte)(statusLogs.checkedAt, since)) : (0, import_drizzle_orm6.eq)(statusLogs.monitorId, id)).orderBy((0, import_drizzle_orm6.desc)(statusLogs.checkedAt)).limit(limit);
-  return c.json(rows);
+  return c.json(await recentLogs(db, id, limit, since));
 });
 router3.get("/:id/check-count", async (c) => {
   const db = getDb(c.env.DB);
-  const id = c.req.param("id");
-  const [{ total }] = await db.select({ total: (0, import_drizzle_orm6.count)() }).from(statusLogs).where((0, import_drizzle_orm6.eq)(statusLogs.monitorId, id));
-  return c.json({ count: total });
+  return c.json({ count: await checkCount(db, c.req.param("id")) });
 });
 router3.get("/:id/incidents", async (c) => {
   const db = getDb(c.env.DB);
-  const id = c.req.param("id");
-  const limit = Number(c.req.query("limit") ?? 50);
-  const rows = await db.select().from(incidents).where((0, import_drizzle_orm6.eq)(incidents.monitorId, id)).orderBy((0, import_drizzle_orm6.desc)(incidents.startedAt)).limit(limit);
-  return c.json(rows);
+  const limit = clampLimit(c.req.query("limit"), 50);
+  return c.json(await monitorIncidents(db, c.req.param("id"), limit));
 });
 router3.get("/:id/uptime", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
   const days = Number(c.req.query("days") ?? 90);
-  const since = Math.floor(Date.now() / 1e3) - days * 86400;
-  const rows = await db.select().from(statusLogs).where((0, import_drizzle_orm6.and)((0, import_drizzle_orm6.eq)(statusLogs.monitorId, id), (0, import_drizzle_orm6.gte)(statusLogs.checkedAt, since)));
-  if (rows.length === 0) return c.json({ uptime: null, days });
-  const up = rows.filter((r) => r.status === "up").length;
-  const uptime = up / rows.length * 100;
-  return c.json({ uptime: Math.round(uptime * 100) / 100, days, total: rows.length, up });
+  const now = Math.floor(Date.now() / 1e3);
+  const { uptime, total, ups } = await uptimeForDays(db, id, days, now);
+  return c.json({ uptime, days, total, up: ups });
 });
 router3.get("/:id/daily", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
   const days = Number(c.req.query("days") ?? 90);
-  const monitor = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm6.eq)(monitors.id, id) });
-  if (!monitor) return c.json({ error: "Not found" }, 404);
   const now = Math.floor(Date.now() / 1e3);
-  const since = now - days * 86400;
-  const allRows = await db.select().from(statusLogs).where((0, import_drizzle_orm6.and)((0, import_drizzle_orm6.eq)(statusLogs.monitorId, id), (0, import_drizzle_orm6.gte)(statusLogs.checkedAt, since)));
-  const dayMap = {};
-  for (const row of allRows) {
-    const day = new Date(row.checkedAt * 1e3).toISOString().slice(0, 10);
-    if (!dayMap[day]) dayMap[day] = { total: 0, ups: 0 };
-    dayMap[day].total++;
-    if (row.status === "up") dayMap[day].ups++;
-  }
-  const result = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date((now - i * 86400) * 1e3).toISOString().slice(0, 10);
-    const e = dayMap[d];
-    result.push({ date: d, uptime: e ? Math.round(e.ups / e.total * 1e3) / 10 : null });
-  }
-  return c.json(result);
+  const monitor = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm7.eq)(monitors.id, id) });
+  if (!monitor) return c.json({ error: "Not found" }, 404);
+  return c.json(await dailySeries(db, id, days, now));
+});
+router3.get("/:id/summary", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+  const now = Math.floor(Date.now() / 1e3);
+  const logLimit = clampLimit(c.req.query("logs"), DEFAULT_SUMMARY_LOGS);
+  const monitor = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm7.eq)(monitors.id, id) });
+  if (!monitor) return c.json({ error: "Not found" }, 404);
+  const [logs, incidentRows, allSettings] = await Promise.all([
+    recentLogs(db, id, logLimit, null),
+    monitorIncidents(db, id, 50),
+    loadSettings(db)
+  ]);
+  const history = await cached(c.env, cacheKeys.monitor(id), cacheTtl(allSettings), async () => {
+    const [daily, u1, u7, u30, u90, count, avgMs] = await Promise.all([
+      dailySeries(db, id, 90, now),
+      uptimeForDays(db, id, 1, now),
+      uptimeForDays(db, id, 7, now),
+      uptimeForDays(db, id, 30, now),
+      uptimeForDays(db, id, 90, now),
+      checkCount(db, id),
+      avgResponseMs(db, id, now - SECONDS_PER_DAY)
+    ]);
+    return {
+      daily,
+      uptime1: u1.uptime,
+      uptime7: u7.uptime,
+      uptime30: u30.uptime,
+      uptime90: u90.uptime,
+      checkCount: count,
+      avgResponseMs: avgMs
+    };
+  });
+  return c.json({ monitor, logs, incidents: incidentRows, ...history });
 });
 var history_default = router3;
 
 // src/routes/notifications.ts
 var import_hono5 = require("hono");
-var import_drizzle_orm7 = require("drizzle-orm");
+var import_drizzle_orm8 = require("drizzle-orm");
 var router4 = new import_hono5.Hono();
 router4.use("*", requireAuth);
 function sanitizeChannel(ch) {
@@ -2294,7 +2639,7 @@ router4.get("/", async (c) => {
 router4.get("/:id", async (c) => {
   const db = getDb(c.env.DB);
   const ch = await db.query.notificationChannels.findFirst({
-    where: (0, import_drizzle_orm7.eq)(notificationChannels.id, c.req.param("id"))
+    where: (0, import_drizzle_orm8.eq)(notificationChannels.id, c.req.param("id"))
   });
   if (!ch) return c.json({ error: "Not found" }, 404);
   return c.json(sanitizeChannel(ch));
@@ -2316,7 +2661,7 @@ router4.post("/", async (c) => {
     createdAt: now
   });
   const created = await db.query.notificationChannels.findFirst({
-    where: (0, import_drizzle_orm7.eq)(notificationChannels.id, id)
+    where: (0, import_drizzle_orm8.eq)(notificationChannels.id, id)
   });
   return c.json(sanitizeChannel(created), 201);
 });
@@ -2325,7 +2670,7 @@ router4.put("/:id", async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json();
   const existing = await db.query.notificationChannels.findFirst({
-    where: (0, import_drizzle_orm7.eq)(notificationChannels.id, id)
+    where: (0, import_drizzle_orm8.eq)(notificationChannels.id, id)
   });
   if (!existing) return c.json({ error: "Not found" }, 404);
   let newConfig;
@@ -2349,22 +2694,22 @@ router4.put("/:id", async (c) => {
     config: newConfig !== void 0 ? JSON.stringify(newConfig) : existing.config,
     active: body.active ?? existing.active,
     isDefault: body.isDefault !== void 0 ? body.isDefault : existing.isDefault
-  }).where((0, import_drizzle_orm7.eq)(notificationChannels.id, id));
+  }).where((0, import_drizzle_orm8.eq)(notificationChannels.id, id));
   const updated = await db.query.notificationChannels.findFirst({
-    where: (0, import_drizzle_orm7.eq)(notificationChannels.id, id)
+    where: (0, import_drizzle_orm8.eq)(notificationChannels.id, id)
   });
   return c.json(sanitizeChannel(updated));
 });
 router4.delete("/:id", async (c) => {
   const db = getDb(c.env.DB);
-  await db.delete(notificationChannels).where((0, import_drizzle_orm7.eq)(notificationChannels.id, c.req.param("id")));
+  await db.delete(notificationChannels).where((0, import_drizzle_orm8.eq)(notificationChannels.id, c.req.param("id")));
   return c.json({ ok: true });
 });
 router4.post("/:id/apply-all-monitors", async (c) => {
   const db = getDb(c.env.DB);
   const channelId = c.req.param("id");
   const ch = await db.query.notificationChannels.findFirst({
-    where: (0, import_drizzle_orm7.eq)(notificationChannels.id, channelId)
+    where: (0, import_drizzle_orm8.eq)(notificationChannels.id, channelId)
   });
   if (!ch) return c.json({ error: "Not found" }, 404);
   const allMonitors = await db.select().from(monitors);
@@ -2376,7 +2721,7 @@ router4.post("/:id/apply-all-monitors", async (c) => {
 router4.post("/:id/test", async (c) => {
   const db = getDb(c.env.DB);
   const ch = await db.query.notificationChannels.findFirst({
-    where: (0, import_drizzle_orm7.eq)(notificationChannels.id, c.req.param("id"))
+    where: (0, import_drizzle_orm8.eq)(notificationChannels.id, c.req.param("id"))
   });
   if (!ch) return c.json({ error: "Not found" }, 404);
   try {
@@ -2413,13 +2758,19 @@ app.put("/", async (c) => {
   const rows = await db.select().from(settings);
   const result = {};
   for (const row of rows) result[row.key] = row.value;
+  await invalidate(c.env, cacheKeys.overview());
   return c.json(result);
+});
+app.post("/rebuild-stats", async (c) => {
+  await rebuildDailyStats(c.env.DB);
+  await invalidate(c.env, cacheKeys.overview());
+  return c.json({ ok: true });
 });
 var settings_default = app;
 
 // src/routes/statusPages.ts
 var import_hono7 = require("hono");
-var import_drizzle_orm8 = require("drizzle-orm");
+var import_drizzle_orm9 = require("drizzle-orm");
 var router5 = new import_hono7.Hono();
 router5.use("*", requireAuth);
 router5.get("/", async (c) => {
@@ -2446,12 +2797,12 @@ router5.post("/", async (c) => {
       await db.insert(statusPageMonitors).values({ pageId: id, monitorId: body.monitorIds[i], sortOrder: i });
     }
   }
-  const created = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm8.eq)(statusPages.id, id) });
+  const created = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm9.eq)(statusPages.id, id) });
   return c.json(created, 201);
 });
 router5.get("/:id", async (c) => {
   const db = getDb(c.env.DB);
-  const page = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm8.eq)(statusPages.id, c.req.param("id")) });
+  const page = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm9.eq)(statusPages.id, c.req.param("id")) });
   if (!page) return c.json({ error: "Not found" }, 404);
   return c.json(page);
 });
@@ -2459,7 +2810,7 @@ router5.put("/:id", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
   const body = await c.req.json();
-  const existing = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm8.eq)(statusPages.id, id) });
+  const existing = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm9.eq)(statusPages.id, id) });
   if (!existing) return c.json({ error: "Not found" }, 404);
   let passwordHash = existing.passwordHash;
   if (body.password === "") {
@@ -2473,161 +2824,162 @@ router5.put("/:id", async (c) => {
     description: body.description !== void 0 ? body.description : existing.description,
     passwordHash,
     showAllMonitors: body.showAllMonitors !== void 0 ? body.showAllMonitors : existing.showAllMonitors
-  }).where((0, import_drizzle_orm8.eq)(statusPages.id, id));
+  }).where((0, import_drizzle_orm9.eq)(statusPages.id, id));
   if (Array.isArray(body.monitorIds)) {
-    await db.delete(statusPageMonitors).where((0, import_drizzle_orm8.eq)(statusPageMonitors.pageId, id));
+    await db.delete(statusPageMonitors).where((0, import_drizzle_orm9.eq)(statusPageMonitors.pageId, id));
     for (let i = 0; i < body.monitorIds.length; i++) {
       await db.insert(statusPageMonitors).values({ pageId: id, monitorId: body.monitorIds[i], sortOrder: i });
     }
   }
-  const updated = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm8.eq)(statusPages.id, id) });
+  const updated = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm9.eq)(statusPages.id, id) });
   return c.json(updated);
 });
 router5.delete("/:id", async (c) => {
   const db = getDb(c.env.DB);
-  await db.delete(statusPages).where((0, import_drizzle_orm8.eq)(statusPages.id, c.req.param("id")));
+  await db.delete(statusPages).where((0, import_drizzle_orm9.eq)(statusPages.id, c.req.param("id")));
   return c.json({ ok: true });
 });
 router5.get("/:id/monitors", async (c) => {
   const db = getDb(c.env.DB);
-  const rows = await db.select().from(statusPageMonitors).where((0, import_drizzle_orm8.eq)(statusPageMonitors.pageId, c.req.param("id")));
+  const rows = await db.select().from(statusPageMonitors).where((0, import_drizzle_orm9.eq)(statusPageMonitors.pageId, c.req.param("id")));
   return c.json(rows.map((r) => r.monitorId));
 });
 var statusPages_default = router5;
 
 // src/routes/publicStatus.ts
 var import_hono8 = require("hono");
-var import_drizzle_orm9 = require("drizzle-orm");
+var import_drizzle_orm10 = require("drizzle-orm");
 var router6 = new import_hono8.Hono();
+var PUBLIC_LOG_LIMIT = 200;
+async function checkPassword(page, provided) {
+  if (!page.passwordHash) return "ok";
+  if (!provided) return "password_required";
+  return await verifyPassword(provided, page.passwordHash) ? "ok" : "wrong_password";
+}
+async function resolveMonitors(db, page) {
+  if (page.showAllMonitors) {
+    const rows2 = await db.select().from(monitors).where((0, import_drizzle_orm10.eq)(monitors.active, true));
+    rows2.sort((a, b) => a.name.localeCompare(b.name));
+    return { ids: rows2.map((r) => r.id), rows: rows2 };
+  }
+  const pageMonitorRows = await db.select().from(statusPageMonitors).where((0, import_drizzle_orm10.eq)(statusPageMonitors.pageId, page.id));
+  pageMonitorRows.sort((a, b) => a.sortOrder - b.sortOrder);
+  const ids = pageMonitorRows.map((r) => r.monitorId);
+  if (ids.length === 0) return { ids, rows: [] };
+  const rows = await db.select().from(monitors).where((0, import_drizzle_orm10.inArray)(monitors.id, ids));
+  return { ids, rows };
+}
 router6.get("/:slug", async (c) => {
   const db = getDb(c.env.DB);
   const slug = c.req.param("slug");
-  const page = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm9.eq)(statusPages.slug, slug) });
+  const page = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm10.eq)(statusPages.slug, slug) });
   if (!page) return c.json({ error: "Not found" }, 404);
-  if (page.passwordHash) {
-    const provided = c.req.header("x-status-password") ?? c.req.query("password");
-    const pageInfo = { name: page.name, description: page.description };
-    if (!provided) return c.json({ error: "password_required", protected: true, page: pageInfo }, 401);
-    if (!await verifyPassword(provided, page.passwordHash)) return c.json({ error: "wrong_password", protected: true, page: pageInfo }, 401);
-  }
-  let monitorIds;
-  let monitorRows;
-  if (page.showAllMonitors) {
-    monitorRows = await db.select().from(monitors).where((0, import_drizzle_orm9.eq)(monitors.active, true));
-    monitorRows.sort((a, b) => a.name.localeCompare(b.name));
-    monitorIds = monitorRows.map((r) => r.id);
-  } else {
-    const pageMonitorRows = await db.select().from(statusPageMonitors).where((0, import_drizzle_orm9.eq)(statusPageMonitors.pageId, page.id));
-    pageMonitorRows.sort((a, b) => a.sortOrder - b.sortOrder);
-    monitorIds = pageMonitorRows.map((r) => r.monitorId);
-    if (monitorIds.length === 0) {
-      return c.json({
-        page: { name: page.name, description: page.description, protected: !!page.passwordHash },
-        monitors: [],
-        incidents: []
-      });
-    }
-    monitorRows = await db.select().from(monitors).where((0, import_drizzle_orm9.inArray)(monitors.id, monitorIds));
-  }
+  const pageInfo = { name: page.name, description: page.description };
+  const auth2 = await checkPassword(page, c.req.header("x-status-password") ?? c.req.query("password"));
+  if (auth2 !== "ok") return c.json({ error: auth2, protected: true, page: pageInfo }, 401);
+  const now = Math.floor(Date.now() / 1e3);
+  const { ids: monitorIds, rows: monitorRows } = await resolveMonitors(db, page);
   if (monitorIds.length === 0) {
     return c.json({
-      page: { name: page.name, description: page.description, protected: !!page.passwordHash },
+      page: { ...pageInfo, protected: !!page.passwordHash },
       monitors: [],
       incidents: []
     });
   }
-  const now = Math.floor(Date.now() / 1e3);
-  const since90d = now - 90 * 86400;
-  const allLogs = await db.select().from(statusLogs).where(
-    (0, import_drizzle_orm9.and)((0, import_drizzle_orm9.inArray)(statusLogs.monitorId, monitorIds), (0, import_drizzle_orm9.gte)(statusLogs.checkedAt, since90d))
-  );
-  const monitorData = monitorRows.map((m) => {
-    const logs = allLogs.filter((l) => l.monitorId === m.id);
-    const upLogs = logs.filter((l) => l.status === "up");
-    const uptime90d = logs.length > 0 ? Math.round(upLogs.length / logs.length * 1e4) / 100 : null;
-    const dayMap = {};
-    for (const log of logs) {
-      const day = new Date(log.checkedAt * 1e3).toISOString().slice(0, 10);
-      if (!dayMap[day]) dayMap[day] = { total: 0, ups: 0 };
-      dayMap[day].total++;
-      if (log.status === "up") dayMap[day].ups++;
-    }
-    const daily = [];
-    for (let i = 89; i >= 0; i--) {
-      const d = new Date((now - i * 86400) * 1e3).toISOString().slice(0, 10);
-      const e = dayMap[d];
-      daily.push({ date: d, uptime: e ? Math.round(e.ups / e.total * 1e3) / 10 : null });
-    }
-    return { id: m.id, name: m.name, status: m.lastStatus, uptime90d, daily };
+  const allSettings = await loadSettings(db);
+  const history = await cached(c.env, cacheKeys.publicPage(slug), cacheTtl(allSettings), async () => {
+    const [daily, uptime] = await Promise.all([
+      dailySeriesBulk(db, monitorIds, 90, now),
+      uptimeBulk(db, monitorIds, 90, now)
+    ]);
+    return {
+      daily: Object.fromEntries(daily),
+      uptime90d: Object.fromEntries([...uptime].map(([id, t]) => [id, t.uptime])),
+      incidents: await publicIncidents(db, monitorIds, now)
+    };
   });
-  monitorData.sort((a, b) => monitorIds.indexOf(a.id) - monitorIds.indexOf(b.id));
-  const incMonitorRows = await db.select().from(incidentMonitors).where((0, import_drizzle_orm9.inArray)(incidentMonitors.monitorId, monitorIds));
-  const incidentIds = [...new Set(incMonitorRows.map((r) => r.incidentId))];
-  let incidentData = [];
-  if (incidentIds.length > 0) {
-    const since14d = now - 14 * 86400;
-    const incRows = await db.select().from(incidentReports).where((0, import_drizzle_orm9.inArray)(incidentReports.id, incidentIds)).orderBy((0, import_drizzle_orm9.desc)(incidentReports.startedAt)).limit(20);
-    for (const inc of incRows) {
-      if (inc.resolvedAt && inc.resolvedAt < since14d) continue;
-      const updates = await db.select().from(incidentUpdates).where((0, import_drizzle_orm9.eq)(incidentUpdates.incidentId, inc.id)).orderBy((0, import_drizzle_orm9.desc)(incidentUpdates.createdAt));
-      const affectedMonitorIds = incMonitorRows.filter((r) => r.incidentId === inc.id).map((r) => r.monitorId);
-      incidentData.push({ ...inc, updates, monitorIds: affectedMonitorIds });
-    }
-  }
+  const byId = new Map(monitorRows.map((m) => [m.id, m]));
+  const monitorData = monitorIds.map((id) => {
+    const m = byId.get(id);
+    if (!m) return null;
+    return {
+      id: m.id,
+      name: m.name,
+      status: m.lastStatus,
+      uptime90d: history.uptime90d[id] ?? null,
+      daily: history.daily[id] ?? []
+    };
+  }).filter((m) => m !== null);
   return c.json({
-    page: { name: page.name, description: page.description, protected: !!page.passwordHash },
+    page: { ...pageInfo, protected: !!page.passwordHash },
     monitors: monitorData,
-    incidents: incidentData
+    incidents: history.incidents
   });
 });
+async function publicIncidents(db, monitorIds, now) {
+  const incMonitorRows = await db.select().from(incidentMonitors).where((0, import_drizzle_orm10.inArray)(incidentMonitors.monitorId, monitorIds));
+  const incidentIds = [...new Set(incMonitorRows.map((r) => r.incidentId))];
+  if (incidentIds.length === 0) return [];
+  const since14d = now - 14 * SECONDS_PER_DAY;
+  const incRows = await db.select().from(incidentReports).where((0, import_drizzle_orm10.inArray)(incidentReports.id, incidentIds)).orderBy((0, import_drizzle_orm10.desc)(incidentReports.startedAt)).limit(20);
+  const visible = incRows.filter((inc) => !(inc.resolvedAt && inc.resolvedAt < since14d));
+  if (visible.length === 0) return [];
+  const updateRows = await db.select().from(incidentUpdates).where((0, import_drizzle_orm10.inArray)(incidentUpdates.incidentId, visible.map((i) => i.id))).orderBy((0, import_drizzle_orm10.desc)(incidentUpdates.createdAt));
+  return visible.map((inc) => ({
+    ...inc,
+    updates: updateRows.filter((u) => u.incidentId === inc.id),
+    monitorIds: incMonitorRows.filter((r) => r.incidentId === inc.id).map((r) => r.monitorId)
+  }));
+}
 router6.get("/:slug/monitors/:monitorId", async (c) => {
   const db = getDb(c.env.DB);
   const slug = c.req.param("slug");
   const monitorId = c.req.param("monitorId");
-  const page = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm9.eq)(statusPages.slug, slug) });
+  const page = await db.query.statusPages.findFirst({ where: (0, import_drizzle_orm10.eq)(statusPages.slug, slug) });
   if (!page) return c.json({ error: "Not found" }, 404);
-  if (page.passwordHash) {
-    const provided = c.req.header("x-status-password") ?? c.req.query("password");
-    if (!provided) return c.json({ error: "password_required", protected: true }, 401);
-    if (!await verifyPassword(provided, page.passwordHash)) return c.json({ error: "wrong_password", protected: true }, 401);
-  }
+  const auth2 = await checkPassword(page, c.req.header("x-status-password") ?? c.req.query("password"));
+  if (auth2 !== "ok") return c.json({ error: auth2, protected: true }, 401);
   let monitor;
   if (page.showAllMonitors) {
     monitor = await db.query.monitors.findFirst({
-      where: (0, import_drizzle_orm9.and)((0, import_drizzle_orm9.eq)(monitors.id, monitorId), (0, import_drizzle_orm9.eq)(monitors.active, true))
+      where: (0, import_drizzle_orm10.and)((0, import_drizzle_orm10.eq)(monitors.id, monitorId), (0, import_drizzle_orm10.eq)(monitors.active, true))
     });
   } else {
-    const rows = await db.select().from(statusPageMonitors).where((0, import_drizzle_orm9.and)((0, import_drizzle_orm9.eq)(statusPageMonitors.pageId, page.id), (0, import_drizzle_orm9.eq)(statusPageMonitors.monitorId, monitorId)));
+    const rows = await db.select().from(statusPageMonitors).where((0, import_drizzle_orm10.and)((0, import_drizzle_orm10.eq)(statusPageMonitors.pageId, page.id), (0, import_drizzle_orm10.eq)(statusPageMonitors.monitorId, monitorId)));
     if (rows.length > 0) {
-      monitor = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm9.eq)(monitors.id, monitorId) });
+      monitor = await db.query.monitors.findFirst({ where: (0, import_drizzle_orm10.eq)(monitors.id, monitorId) });
     }
   }
   if (!monitor) return c.json({ error: "Not found" }, 404);
   const now = Math.floor(Date.now() / 1e3);
-  const since90d = now - 90 * 86400;
-  const allLogs = await db.select().from(statusLogs).where((0, import_drizzle_orm9.and)((0, import_drizzle_orm9.eq)(statusLogs.monitorId, monitorId), (0, import_drizzle_orm9.gte)(statusLogs.checkedAt, since90d))).orderBy((0, import_drizzle_orm9.desc)(statusLogs.checkedAt));
-  const dayMap = {};
-  for (const log of allLogs) {
-    const day = new Date(log.checkedAt * 1e3).toISOString().slice(0, 10);
-    if (!dayMap[day]) dayMap[day] = { total: 0, ups: 0 };
-    dayMap[day].total++;
-    if (log.status === "up") dayMap[day].ups++;
-  }
-  const daily = [];
-  for (let i = 89; i >= 0; i--) {
-    const d = new Date((now - i * 86400) * 1e3).toISOString().slice(0, 10);
-    const e = dayMap[d];
-    daily.push({ date: d, uptime: e ? Math.round(e.ups / e.total * 1e3) / 10 : null });
-  }
-  function uptimeFor(sinceSecs) {
-    const rows = allLogs.filter((l) => l.checkedAt >= sinceSecs);
-    if (!rows.length) return null;
-    return Math.round(rows.filter((l) => l.status === "up").length / rows.length * 1e4) / 100;
-  }
-  const logs24h = allLogs.filter((l) => l.checkedAt >= now - 86400);
-  const withTime = logs24h.filter((l) => l.responseTimeMs !== null);
-  const avgResponseMs = withTime.length > 0 ? Math.round(withTime.reduce((s2, l) => s2 + l.responseTimeMs, 0) / withTime.length) : null;
-  const monitorIncidents = await db.select().from(incidents).where((0, import_drizzle_orm9.eq)(incidents.monitorId, monitorId)).orderBy((0, import_drizzle_orm9.desc)(incidents.startedAt)).limit(20);
+  const allSettings = await loadSettings(db);
+  const [logs, monitorIncidents2] = await Promise.all([
+    db.select().from(statusLogs).where((0, import_drizzle_orm10.eq)(statusLogs.monitorId, monitorId)).orderBy((0, import_drizzle_orm10.desc)(statusLogs.checkedAt)).limit(PUBLIC_LOG_LIMIT),
+    db.select().from(incidents).where((0, import_drizzle_orm10.eq)(incidents.monitorId, monitorId)).orderBy((0, import_drizzle_orm10.desc)(incidents.startedAt)).limit(20)
+  ]);
+  const history = await cached(
+    c.env,
+    cacheKeys.publicMonitor(slug, monitorId),
+    cacheTtl(allSettings),
+    async () => {
+      const [daily, u1, u7, u30, u90, avgMs] = await Promise.all([
+        dailySeries(db, monitorId, 90, now),
+        uptimeForDays(db, monitorId, 1, now),
+        uptimeForDays(db, monitorId, 7, now),
+        uptimeForDays(db, monitorId, 30, now),
+        uptimeForDays(db, monitorId, 90, now),
+        avgResponseMs(db, monitorId, now - SECONDS_PER_DAY)
+      ]);
+      return {
+        daily,
+        uptime1: u1.uptime,
+        uptime7: u7.uptime,
+        uptime30: u30.uptime,
+        uptime90: u90.uptime,
+        avgResponseMs: avgMs
+      };
+    }
+  );
   return c.json({
     name: monitor.name,
     type: monitor.type,
@@ -2635,19 +2987,14 @@ router6.get("/:slug/monitors/:monitorId", async (c) => {
     tags: monitor.tags,
     lastStatus: monitor.lastStatus,
     lastCheckedAt: monitor.lastCheckedAt,
-    uptime1: uptimeFor(now - 86400),
-    uptime7: uptimeFor(now - 7 * 86400),
-    uptime30: uptimeFor(now - 30 * 86400),
-    uptime90: uptimeFor(since90d),
-    avgResponseMs,
-    daily,
-    logs: allLogs.slice(0, 200).map((l) => ({
+    ...history,
+    logs: logs.map((l) => ({
       checkedAt: l.checkedAt,
       status: l.status,
       responseTimeMs: l.responseTimeMs,
       message: l.message
     })),
-    incidents: monitorIncidents.map((i) => ({
+    incidents: monitorIncidents2.map((i) => ({
       startedAt: i.startedAt,
       resolvedAt: i.resolvedAt,
       durationSeconds: i.durationSeconds
@@ -2658,15 +3005,15 @@ var publicStatus_default = router6;
 
 // src/routes/incidentReports.ts
 var import_hono9 = require("hono");
-var import_drizzle_orm10 = require("drizzle-orm");
+var import_drizzle_orm11 = require("drizzle-orm");
 var router7 = new import_hono9.Hono();
 router7.use("*", requireAuth);
 router7.get("/", async (c) => {
   const db = getDb(c.env.DB);
-  const rows = await db.select().from(incidentReports).orderBy((0, import_drizzle_orm10.desc)(incidentReports.startedAt)).limit(100);
+  const rows = await db.select().from(incidentReports).orderBy((0, import_drizzle_orm11.desc)(incidentReports.startedAt)).limit(100);
   const enriched = await Promise.all(rows.map(async (inc) => {
-    const links = await db.select().from(incidentMonitors).where((0, import_drizzle_orm10.eq)(incidentMonitors.incidentId, inc.id));
-    const updates = await db.select().from(incidentUpdates).where((0, import_drizzle_orm10.eq)(incidentUpdates.incidentId, inc.id)).orderBy((0, import_drizzle_orm10.desc)(incidentUpdates.createdAt));
+    const links = await db.select().from(incidentMonitors).where((0, import_drizzle_orm11.eq)(incidentMonitors.incidentId, inc.id));
+    const updates = await db.select().from(incidentUpdates).where((0, import_drizzle_orm11.eq)(incidentUpdates.incidentId, inc.id)).orderBy((0, import_drizzle_orm11.desc)(incidentUpdates.createdAt));
     return { ...inc, monitorIds: links.map((r) => r.monitorId), updates };
   }));
   return c.json(enriched);
@@ -2696,16 +3043,16 @@ router7.post("/", async (c) => {
       await db.insert(incidentMonitors).values({ incidentId: id, monitorId });
     }
   }
-  const created = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm10.eq)(incidentReports.id, id) });
+  const created = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm11.eq)(incidentReports.id, id) });
   return c.json(created, 201);
 });
 router7.get("/:id", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
-  const incident = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm10.eq)(incidentReports.id, id) });
+  const incident = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm11.eq)(incidentReports.id, id) });
   if (!incident) return c.json({ error: "Not found" }, 404);
-  const updates = await db.select().from(incidentUpdates).where((0, import_drizzle_orm10.eq)(incidentUpdates.incidentId, id)).orderBy((0, import_drizzle_orm10.desc)(incidentUpdates.createdAt));
-  const links = await db.select().from(incidentMonitors).where((0, import_drizzle_orm10.eq)(incidentMonitors.incidentId, id));
+  const updates = await db.select().from(incidentUpdates).where((0, import_drizzle_orm11.eq)(incidentUpdates.incidentId, id)).orderBy((0, import_drizzle_orm11.desc)(incidentUpdates.createdAt));
+  const links = await db.select().from(incidentMonitors).where((0, import_drizzle_orm11.eq)(incidentMonitors.incidentId, id));
   return c.json({ ...incident, updates, monitorIds: links.map((r) => r.monitorId) });
 });
 router7.put("/:id", async (c) => {
@@ -2713,21 +3060,21 @@ router7.put("/:id", async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json();
   const now = Math.floor(Date.now() / 1e3);
-  const existing = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm10.eq)(incidentReports.id, id) });
+  const existing = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm11.eq)(incidentReports.id, id) });
   if (!existing) return c.json({ error: "Not found" }, 404);
   const resolvedAt = body.status === "resolved" && !existing.resolvedAt ? now : existing.resolvedAt;
   await db.update(incidentReports).set({
     title: body.title ?? existing.title,
     status: body.status ?? existing.status,
     resolvedAt
-  }).where((0, import_drizzle_orm10.eq)(incidentReports.id, id));
+  }).where((0, import_drizzle_orm11.eq)(incidentReports.id, id));
   if (Array.isArray(body.monitorIds)) {
-    await db.delete(incidentMonitors).where((0, import_drizzle_orm10.eq)(incidentMonitors.incidentId, id));
+    await db.delete(incidentMonitors).where((0, import_drizzle_orm11.eq)(incidentMonitors.incidentId, id));
     for (const monitorId of body.monitorIds) {
       await db.insert(incidentMonitors).values({ incidentId: id, monitorId });
     }
   }
-  const updated = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm10.eq)(incidentReports.id, id) });
+  const updated = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm11.eq)(incidentReports.id, id) });
   return c.json(updated);
 });
 router7.post("/:id/updates", async (c) => {
@@ -2735,7 +3082,7 @@ router7.post("/:id/updates", async (c) => {
   const incidentId = c.req.param("id");
   const body = await c.req.json();
   const now = Math.floor(Date.now() / 1e3);
-  const incident = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm10.eq)(incidentReports.id, incidentId) });
+  const incident = await db.query.incidentReports.findFirst({ where: (0, import_drizzle_orm11.eq)(incidentReports.id, incidentId) });
   if (!incident) return c.json({ error: "Not found" }, 404);
   const updateId = crypto.randomUUID();
   await db.insert(incidentUpdates).values({
@@ -2745,13 +3092,13 @@ router7.post("/:id/updates", async (c) => {
     status: body.status
   });
   const resolvedAt = body.status === "resolved" && !incident.resolvedAt ? now : incident.resolvedAt;
-  await db.update(incidentReports).set({ status: body.status, resolvedAt }).where((0, import_drizzle_orm10.eq)(incidentReports.id, incidentId));
-  const update = await db.query.incidentUpdates.findFirst({ where: (0, import_drizzle_orm10.eq)(incidentUpdates.id, updateId) });
+  await db.update(incidentReports).set({ status: body.status, resolvedAt }).where((0, import_drizzle_orm11.eq)(incidentReports.id, incidentId));
+  const update = await db.query.incidentUpdates.findFirst({ where: (0, import_drizzle_orm11.eq)(incidentUpdates.id, updateId) });
   return c.json(update, 201);
 });
 router7.delete("/:id", async (c) => {
   const db = getDb(c.env.DB);
-  await db.delete(incidentReports).where((0, import_drizzle_orm10.eq)(incidentReports.id, c.req.param("id")));
+  await db.delete(incidentReports).where((0, import_drizzle_orm11.eq)(incidentReports.id, c.req.param("id")));
   return c.json({ ok: true });
 });
 var incidentReports_default = router7;
@@ -2967,8 +3314,8 @@ async function main() {
   const port = parseInt(process.env.PORT ?? "3000", 10);
   (0, import_node_server.serve)(
     {
-      // Inject env bindings by passing them as the second fetch argument
-      fetch: (req, _cfEnv, ctx) => app2.fetch(req, env, ctx),
+      // Inject env bindings as the second fetch argument (c.env in all routes)
+      fetch: (req) => app2.fetch(req, env),
       port
     },
     (info) => console.log(`Pingflare running on http://0.0.0.0:${info.port}`)

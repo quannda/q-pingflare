@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte'
   import { get } from 'svelte/store'
   import { api } from '$lib/api'
+  import { startPolling } from '$lib/poll'
   import { monitors } from '$lib/stores'
   import { t, locale, nMonitors } from '$lib/i18n'
   import MonitorCard from '$lib/components/MonitorCard.svelte'
@@ -15,7 +16,7 @@
   let filter = ''
   let typeFilter: 'all' | 'http' | 'heartbeat' = 'all'
   let statusFilter: 'all' | 'up' | 'down' | 'pending' = 'all'
-  let ticker: ReturnType<typeof setInterval>
+  let stopPolling: () => void
 
   async function load() {
     try {
@@ -28,8 +29,8 @@
     }
   }
 
-  onMount(() => { load(); ticker = setInterval(load, 10_000) })
-  onDestroy(() => clearInterval(ticker))
+  onMount(() => { load(); stopPolling = startPolling(load) })
+  onDestroy(() => stopPolling?.())
 
   async function deleteMonitor(id: string, name: string) {
     if (!confirm(get(t)('confirm.deleteMonitor', { name }))) return

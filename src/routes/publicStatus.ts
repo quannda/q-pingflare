@@ -1,10 +1,50 @@
 import { Hono } from 'hono'
-import { eq, desc, and, gte, inArray } from 'drizzle-orm'
+import { eq, desc, and, inArray } from 'drizzle-orm'
 import { getDb, statusPages, statusPageMonitors, monitors, statusLogs, incidents, incidentReports, incidentUpdates, incidentMonitors } from '../db'
 import { verifyPassword } from '../utils'
+import { cacheKeys, cached, cacheTtl } from '../cache'
+import {
+  SECONDS_PER_DAY,
+  avgResponseMs,
+  dailySeries,
+  dailySeriesBulk,
+  loadSettings,
+  uptimeBulk,
+  uptimeForDays,
+} from '../services/stats'
+import type { Db } from '../db'
 import type { Env } from '../index'
 
 const router = new Hono<{ Bindings: Env }>()
+
+const PUBLIC_LOG_LIMIT = 200
+
+async function checkPassword(
+  page: { passwordHash: string | null },
+  provided: string | undefined,
+): Promise<'ok' | 'password_required' | 'wrong_password'> {
+  if (!page.passwordHash) return 'ok'
+  if (!provided) return 'password_required'
+  return (await verifyPassword(provided, page.passwordHash)) ? 'ok' : 'wrong_password'
+}
+
+async function resolveMonitors(db: Db, page: { id: string; showAllMonitors: boolean }) {
+  if (page.showAllMonitors) {
+    const rows = await db.select().from(monitors).where(eq(monitors.active, true))
+    rows.sort((a, b) => a.name.localeCompare(b.name))
+    return { ids: rows.map(r => r.id), rows }
+  }
+
+  const pageMonitorRows = await db.select().from(statusPageMonitors)
+    .where(eq(statusPageMonitors.pageId, page.id))
+  pageMonitorRows.sort((a, b) => a.sortOrder - b.sortOrder)
+  const ids = pageMonitorRows.map(r => r.monitorId)
+
+  if (ids.length === 0) return { ids, rows: [] }
+
+  const rows = await db.select().from(monitors).where(inArray(monitors.id, ids))
+  return { ids, rows }
+}
 
 router.get('/:slug', async (c) => {
   const db = getDb(c.env.DB)
@@ -13,106 +53,86 @@ router.get('/:slug', async (c) => {
   const page = await db.query.statusPages.findFirst({ where: eq(statusPages.slug, slug) })
   if (!page) return c.json({ error: 'Not found' }, 404)
 
-  if (page.passwordHash) {
-    const provided = c.req.header('x-status-password') ?? c.req.query('password')
-    const pageInfo = { name: page.name, description: page.description }
-    if (!provided) return c.json({ error: 'password_required', protected: true, page: pageInfo }, 401)
-    if (!(await verifyPassword(provided, page.passwordHash))) return c.json({ error: 'wrong_password', protected: true, page: pageInfo }, 401)
-  }
+  const pageInfo = { name: page.name, description: page.description }
+  const auth = await checkPassword(page, c.req.header('x-status-password') ?? c.req.query('password'))
+  if (auth !== 'ok') return c.json({ error: auth, protected: true, page: pageInfo }, 401)
 
-  let monitorIds: string[]
-  let monitorRows: typeof monitors.$inferSelect[]
-
-  if (page.showAllMonitors) {
-    monitorRows = await db.select().from(monitors).where(eq(monitors.active, true))
-    monitorRows.sort((a, b) => a.name.localeCompare(b.name))
-    monitorIds = monitorRows.map(r => r.id)
-  } else {
-    const pageMonitorRows = await db.select().from(statusPageMonitors)
-      .where(eq(statusPageMonitors.pageId, page.id))
-    pageMonitorRows.sort((a, b) => a.sortOrder - b.sortOrder)
-    monitorIds = pageMonitorRows.map(r => r.monitorId)
-
-    if (monitorIds.length === 0) {
-      return c.json({
-        page: { name: page.name, description: page.description, protected: !!page.passwordHash },
-        monitors: [],
-        incidents: [],
-      })
-    }
-
-    monitorRows = await db.select().from(monitors).where(inArray(monitors.id, monitorIds))
-  }
+  const now = Math.floor(Date.now() / 1000)
+  const { ids: monitorIds, rows: monitorRows } = await resolveMonitors(db, page)
 
   if (monitorIds.length === 0) {
     return c.json({
-      page: { name: page.name, description: page.description, protected: !!page.passwordHash },
+      page: { ...pageInfo, protected: !!page.passwordHash },
       monitors: [],
       incidents: [],
     })
   }
 
-  const now = Math.floor(Date.now() / 1000)
-  const since90d = now - 90 * 86400
-  const allLogs = await db.select().from(statusLogs).where(
-    and(inArray(statusLogs.monitorId, monitorIds), gte(statusLogs.checkedAt, since90d))
-  )
+  const allSettings = await loadSettings(db)
 
-  const monitorData = monitorRows.map(m => {
-    const logs = allLogs.filter(l => l.monitorId === m.id)
-    const upLogs = logs.filter(l => l.status === 'up')
-    const uptime90d = logs.length > 0 ? Math.round((upLogs.length / logs.length) * 10000) / 100 : null
-
-    const dayMap: Record<string, { total: number; ups: number }> = {}
-    for (const log of logs) {
-      const day = new Date(log.checkedAt * 1000).toISOString().slice(0, 10)
-      if (!dayMap[day]) dayMap[day] = { total: 0, ups: 0 }
-      dayMap[day].total++
-      if (log.status === 'up') dayMap[day].ups++
+  // Only the 90-day history is cached. Current up/down comes from the monitor
+  // rows read above, so the badges stay live even on a cache hit.
+  const history = await cached(c.env, cacheKeys.publicPage(slug), cacheTtl(allSettings), async () => {
+    const [daily, uptime] = await Promise.all([
+      dailySeriesBulk(db, monitorIds, 90, now),
+      uptimeBulk(db, monitorIds, 90, now),
+    ])
+    return {
+      daily: Object.fromEntries(daily),
+      uptime90d: Object.fromEntries([...uptime].map(([id, t]) => [id, t.uptime])),
+      incidents: await publicIncidents(db, monitorIds, now),
     }
-
-    const daily = []
-    for (let i = 89; i >= 0; i--) {
-      const d = new Date((now - i * 86400) * 1000).toISOString().slice(0, 10)
-      const e = dayMap[d]
-      daily.push({ date: d, uptime: e ? Math.round((e.ups / e.total) * 1000) / 10 : null })
-    }
-
-    return { id: m.id, name: m.name, status: m.lastStatus, uptime90d, daily }
   })
 
-  monitorData.sort((a, b) => monitorIds.indexOf(a.id) - monitorIds.indexOf(b.id))
+  const byId = new Map(monitorRows.map(m => [m.id, m]))
+  const monitorData = monitorIds
+    .map(id => {
+      const m = byId.get(id)
+      if (!m) return null
+      return {
+        id: m.id,
+        name: m.name,
+        status: m.lastStatus,
+        uptime90d: history.uptime90d[id] ?? null,
+        daily: history.daily[id] ?? [],
+      }
+    })
+    .filter((m): m is NonNullable<typeof m> => m !== null)
 
+  return c.json({
+    page: { ...pageInfo, protected: !!page.passwordHash },
+    monitors: monitorData,
+    incidents: history.incidents,
+  })
+})
+
+/** Published incident reports touching any of these monitors, last 14 days. */
+async function publicIncidents(db: Db, monitorIds: string[], now: number) {
   const incMonitorRows = await db.select().from(incidentMonitors)
     .where(inArray(incidentMonitors.monitorId, monitorIds))
   const incidentIds = [...new Set(incMonitorRows.map(r => r.incidentId))]
+  if (incidentIds.length === 0) return []
 
-  let incidentData: object[] = []
-  if (incidentIds.length > 0) {
-    const since14d = now - 14 * 86400
-    const incRows = await db.select().from(incidentReports)
-      .where(inArray(incidentReports.id, incidentIds))
-      .orderBy(desc(incidentReports.startedAt))
-      .limit(20)
+  const since14d = now - 14 * SECONDS_PER_DAY
+  const incRows = await db.select().from(incidentReports)
+    .where(inArray(incidentReports.id, incidentIds))
+    .orderBy(desc(incidentReports.startedAt))
+    .limit(20)
 
-    for (const inc of incRows) {
-      if (inc.resolvedAt && inc.resolvedAt < since14d) continue
-      const updates = await db.select().from(incidentUpdates)
-        .where(eq(incidentUpdates.incidentId, inc.id))
-        .orderBy(desc(incidentUpdates.createdAt))
-      const affectedMonitorIds = incMonitorRows
-        .filter(r => r.incidentId === inc.id)
-        .map(r => r.monitorId)
-      incidentData.push({ ...inc, updates, monitorIds: affectedMonitorIds })
-    }
-  }
+  const visible = incRows.filter(inc => !(inc.resolvedAt && inc.resolvedAt < since14d))
+  if (visible.length === 0) return []
 
-  return c.json({
-    page: { name: page.name, description: page.description, protected: !!page.passwordHash },
-    monitors: monitorData,
-    incidents: incidentData,
-  })
-})
+  // One query for every incident's updates instead of one query per incident.
+  const updateRows = await db.select().from(incidentUpdates)
+    .where(inArray(incidentUpdates.incidentId, visible.map(i => i.id)))
+    .orderBy(desc(incidentUpdates.createdAt))
+
+  return visible.map(inc => ({
+    ...inc,
+    updates: updateRows.filter(u => u.incidentId === inc.id),
+    monitorIds: incMonitorRows.filter(r => r.incidentId === inc.id).map(r => r.monitorId),
+  }))
+}
 
 router.get('/:slug/monitors/:monitorId', async (c) => {
   const db = getDb(c.env.DB)
@@ -122,11 +142,8 @@ router.get('/:slug/monitors/:monitorId', async (c) => {
   const page = await db.query.statusPages.findFirst({ where: eq(statusPages.slug, slug) })
   if (!page) return c.json({ error: 'Not found' }, 404)
 
-  if (page.passwordHash) {
-    const provided = c.req.header('x-status-password') ?? c.req.query('password')
-    if (!provided) return c.json({ error: 'password_required', protected: true }, 401)
-    if (!(await verifyPassword(provided, page.passwordHash))) return c.json({ error: 'wrong_password', protected: true }, 401)
-  }
+  const auth = await checkPassword(page, c.req.header('x-status-password') ?? c.req.query('password'))
+  if (auth !== 'ok') return c.json({ error: auth, protected: true }, 401)
 
   let monitor: typeof monitors.$inferSelect | undefined
   if (page.showAllMonitors) {
@@ -143,42 +160,42 @@ router.get('/:slug/monitors/:monitorId', async (c) => {
   if (!monitor) return c.json({ error: 'Not found' }, 404)
 
   const now = Math.floor(Date.now() / 1000)
-  const since90d = now - 90 * 86400
+  const allSettings = await loadSettings(db)
 
-  const allLogs = await db.select().from(statusLogs)
-    .where(and(eq(statusLogs.monitorId, monitorId), gte(statusLogs.checkedAt, since90d)))
-    .orderBy(desc(statusLogs.checkedAt))
+  const [logs, monitorIncidents] = await Promise.all([
+    db.select().from(statusLogs)
+      .where(eq(statusLogs.monitorId, monitorId))
+      .orderBy(desc(statusLogs.checkedAt))
+      .limit(PUBLIC_LOG_LIMIT),
+    db.select().from(incidents)
+      .where(eq(incidents.monitorId, monitorId))
+      .orderBy(desc(incidents.startedAt))
+      .limit(20),
+  ])
 
-  const dayMap: Record<string, { total: number; ups: number }> = {}
-  for (const log of allLogs) {
-    const day = new Date(log.checkedAt * 1000).toISOString().slice(0, 10)
-    if (!dayMap[day]) dayMap[day] = { total: 0, ups: 0 }
-    dayMap[day].total++
-    if (log.status === 'up') dayMap[day].ups++
-  }
-  const daily = []
-  for (let i = 89; i >= 0; i--) {
-    const d = new Date((now - i * 86400) * 1000).toISOString().slice(0, 10)
-    const e = dayMap[d]
-    daily.push({ date: d, uptime: e ? Math.round((e.ups / e.total) * 1000) / 10 : null })
-  }
-
-  function uptimeFor(sinceSecs: number): number | null {
-    const rows = allLogs.filter(l => l.checkedAt >= sinceSecs)
-    if (!rows.length) return null
-    return Math.round((rows.filter(l => l.status === 'up').length / rows.length) * 10000) / 100
-  }
-
-  const logs24h = allLogs.filter(l => l.checkedAt >= now - 86400)
-  const withTime = logs24h.filter(l => l.responseTimeMs !== null)
-  const avgResponseMs = withTime.length > 0
-    ? Math.round(withTime.reduce((s, l) => s + l.responseTimeMs!, 0) / withTime.length)
-    : null
-
-  const monitorIncidents = await db.select().from(incidents)
-    .where(eq(incidents.monitorId, monitorId))
-    .orderBy(desc(incidents.startedAt))
-    .limit(20)
+  const history = await cached(
+    c.env,
+    cacheKeys.publicMonitor(slug, monitorId),
+    cacheTtl(allSettings),
+    async () => {
+      const [daily, u1, u7, u30, u90, avgMs] = await Promise.all([
+        dailySeries(db, monitorId, 90, now),
+        uptimeForDays(db, monitorId, 1, now),
+        uptimeForDays(db, monitorId, 7, now),
+        uptimeForDays(db, monitorId, 30, now),
+        uptimeForDays(db, monitorId, 90, now),
+        avgResponseMs(db, monitorId, now - SECONDS_PER_DAY),
+      ])
+      return {
+        daily,
+        uptime1: u1.uptime,
+        uptime7: u7.uptime,
+        uptime30: u30.uptime,
+        uptime90: u90.uptime,
+        avgResponseMs: avgMs,
+      }
+    },
+  )
 
   return c.json({
     name: monitor.name,
@@ -187,13 +204,8 @@ router.get('/:slug/monitors/:monitorId', async (c) => {
     tags: monitor.tags,
     lastStatus: monitor.lastStatus,
     lastCheckedAt: monitor.lastCheckedAt,
-    uptime1: uptimeFor(now - 86400),
-    uptime7: uptimeFor(now - 7 * 86400),
-    uptime30: uptimeFor(now - 30 * 86400),
-    uptime90: uptimeFor(since90d),
-    avgResponseMs,
-    daily,
-    logs: allLogs.slice(0, 200).map(l => ({
+    ...history,
+    logs: logs.map(l => ({
       checkedAt: l.checkedAt,
       status: l.status,
       responseTimeMs: l.responseTimeMs,

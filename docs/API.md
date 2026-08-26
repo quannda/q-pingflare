@@ -19,11 +19,13 @@ Obtain a token by calling `POST /api/auth/login`
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/monitors` | List all monitors |
+| GET | `/api/monitors/overview` | **Preferred for dashboards.** All monitors plus their 30-day uptime in one request |
 | POST | `/api/monitors` | Create a monitor |
 | GET | `/api/monitors/:id` | Get a monitor |
 | PUT | `/api/monitors/:id` | Update a monitor |
 | DELETE | `/api/monitors/:id` | Delete a monitor |
-| GET | `/api/monitors/:id/logs` | Status logs, supports `?hours=24&limit=500` |
+| GET | `/api/monitors/:id/summary` | **Preferred for detail views.** Monitor, recent checks, incidents, 90-day chart and all uptime windows in one request. Supports `?logs=300` |
+| GET | `/api/monitors/:id/logs` | Status logs, supports `?hours=24&limit=500` (capped at 1000) |
 | GET | `/api/monitors/:id/incidents` | Downtime incidents |
 | GET | `/api/monitors/:id/uptime` | Uptime percentage, supports `?days=90` |
 | GET | `/api/monitors/:id/daily` | Per-day uptime breakdown, supports `?days=90` |
@@ -104,8 +106,31 @@ GET /api/events?token=<token>
 |---|---|---|
 | GET | `/api/settings` | Get all settings |
 | PUT | `/api/settings` | Update settings |
+| POST | `/api/settings/rebuild-stats` | Recompute the `daily_stats` rollup from the raw logs |
 
-Available settings keys: `retention_days` (default `90`), `site_title`.
+Available settings keys:
+
+| Key | Default | Description |
+|---|---|---|
+| `retention_days` | `90` | How long raw `status_logs` rows are kept. Cleanup runs at most once a day. |
+| `stats_retention_days` | `400` | How long the per-day rollup is kept. Charts read this, so it can outlive the raw logs. |
+| `cache_ttl` | `900` | Seconds a cached aggregate lives in KV. Each key is written at most `86400 / cache_ttl` times a day, so lower values cost more KV writes. Minimum 60. |
+| `site_title` | — | Shown in the UI. |
+| `locale` | `en` | Notification language. |
+
+`rebuild-stats` is only needed after restoring a backup, or once after upgrading a
+database that predates the rollup if the automatic backfill did not finish. It
+costs one full scan of `status_logs`.
+
+### Aggregation and freshness
+
+Long-range history (the 90-day chart, and uptime over 7/30/90 days) is read from a
+per-day rollup table rather than the raw logs, and is cached in KV when a
+namespace is bound. Current up/down state, recent checks and incidents are always
+read live, so a cache hit never makes a monitor look healthy when it is not.
+
+Uptime windows of 2 days or less are computed from the raw logs so they remain
+precise to the second; longer windows are calendar-day aligned (UTC).
 
 ---
 

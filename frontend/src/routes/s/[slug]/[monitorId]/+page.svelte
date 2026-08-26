@@ -11,6 +11,7 @@
   import ResponseTimeChart from '$lib/components/ResponseTimeChart.svelte'
   import HeartbeatBorder from '$lib/components/HeartbeatBorder.svelte'
   import type { StatusLog, DailyUptime } from '$lib/api'
+  import { PUBLIC_POLL_INTERVAL_MS, startPolling } from '$lib/poll'
 
   const slug = $page.params.slug
   const monitorId = $page.params.monitorId
@@ -38,7 +39,7 @@
   let isProtected = false
   let wrongPassword = false
   let password = ''
-  let ticker: ReturnType<typeof setInterval>
+  let stopPolling: () => void
 
   async function load(pw?: string) {
     const headers: Record<string, string> = {}
@@ -79,11 +80,11 @@
 
   onMount(() => {
     load()
-    ticker = setInterval(() => load(password || undefined), 30_000)
+    stopPolling = startPolling(() => load(password || undefined), PUBLIC_POLL_INTERVAL_MS)
     document.addEventListener('fullscreenchange', onFullscreenChange)
   })
   onDestroy(() => {
-    clearInterval(ticker)
+    stopPolling?.()
     document.removeEventListener('fullscreenchange', onFullscreenChange)
   })
 
