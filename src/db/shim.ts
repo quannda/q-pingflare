@@ -9,8 +9,16 @@ class ShimStatement {
     private readonly values: unknown[] = [],
   ) {}
 
+  private cachedStmt?: Database.Statement
+
+  /**
+   * Memoised. This used to re-prepare on every access, which silently broke
+   * raw(): the `raw(true)` flag was set on a throwaway statement and the
+   * subsequent all() ran on a fresh one that still returned objects. Drizzle maps
+   * those rows positionally, so every read came back empty.
+   */
   private get stmt(): Database.Statement {
-    return this.db.prepare(this.sql)
+    return (this.cachedStmt ??= this.db.prepare(this.sql))
   }
 
   bind(...args: unknown[]): ShimStatement {
@@ -58,16 +66,20 @@ class ShimStatement {
   }
 
   async raw<T = unknown[]>(options?: { columnNames?: boolean }): Promise<T[]> {
-    this.stmt.raw(true)
-    const rows = (
-      this.values.length ? this.stmt.all(...this.values) : this.stmt.all()
-    ) as T[]
-    this.stmt.raw(false)
-    if (options?.columnNames) {
-      const cols = this.stmt.columns().map((c) => c.name)
-      return [cols as unknown as T, ...rows]
+    const stmt = this.stmt
+    stmt.raw(true)
+    try {
+      const rows = (
+        this.values.length ? stmt.all(...this.values) : stmt.all()
+      ) as T[]
+      if (options?.columnNames) {
+        const cols = stmt.columns().map((c) => c.name)
+        return [cols as unknown as T, ...rows]
+      }
+      return rows
+    } finally {
+      stmt.raw(false)
     }
-    return rows
   }
 
   _execSync(): void {
