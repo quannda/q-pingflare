@@ -28,6 +28,13 @@ export type Env = {
   ADMIN_PASS: string
   JWT_SECRET: string
   ENCRYPTION_KEY: string
+  /**
+   * "true" / "1" disables the built-in login: requireAuth becomes a no-op and
+   * the frontend stops redirecting to /login. Only safe when something in front
+   * of the origin already authenticates (Cloudflare Access, an SSO proxy).
+   * See src/middleware/auth.ts.
+   */
+  AUTH_DISABLED?: string
 }
 
 const app = new Hono<{ Bindings: Env }>()

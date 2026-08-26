@@ -57,6 +57,7 @@ Still on **Settings > Variables**, add the following under **Secret variables**:
 | `ADMIN_PASS` | Yes | Password |
 | `JWT_SECRET` | Yes | Secret used to sign JWT tokens, min 32 characters |
 | `ENCRYPTION_KEY` | Yes | Key used to encrypt notification credentials at rest. Min 32 characters. |
+| `AUTH_DISABLED` | No | Set to `true` to remove the built-in login. Only for origins already protected by Cloudflare Access or another identity proxy — see [Bypassing the login](#-bypassing-the-login-cloudflare-access--sso-proxy). |
 
 ### 4. Redeploy
 
@@ -86,6 +87,9 @@ Open `http://localhost:3000`.
 | `ADMIN_PASS` | Yes | — | Dashboard password |
 | `JWT_SECRET` | Yes | — | JWT signing key, min 32 chars |
 | `ENCRYPTION_KEY` | Yes | — | AES-GCM key for notification credentials, min 32 chars |
+| `AUTH_DISABLED` | No | `false` | `true` removes the built-in login. Only behind a trusted proxy — see [Bypassing the login](#-bypassing-the-login-cloudflare-access--sso-proxy) |
+
+> With `AUTH_DISABLED=true`, `ADMIN_USER` / `ADMIN_PASS` / `JWT_SECRET` become optional; only `ENCRYPTION_KEY` stays required.
 
 > Mount a volume at `/data` to persist the database
 
@@ -105,6 +109,39 @@ fly secrets set \
 
 fly deploy
 ```
+
+---
+
+## 🔓 Bypassing the login (Cloudflare Access / SSO proxy)
+
+If the dashboard already sits behind an external identity layer, the built-in
+username/password screen is redundant. Set `AUTH_DISABLED=true` and it disappears:
+`requireAuth` becomes a no-op, the frontend stops redirecting to `/login`, and the
+sign-out button is hidden.
+
+**This makes every `/api` route reachable by anyone who can reach the origin.** The
+proxy is now the only thing authenticating, so it has to cover every path in:
+
+- **Cloudflare Access** — an Access application covers one hostname, so it must
+  cover *every* hostname the Worker answers on. A `<worker>.<subdomain>.workers.dev`
+  URL can be protected directly (Zero Trust → Access → Applications → Self-hosted,
+  pick the Worker); if you only put a policy on a custom domain, either add a second
+  application for the workers.dev hostname or disable that route entirely
+  (Worker → Settings → Domains & Routes). Verify with
+  `curl -sI https://<host>/api/health` — a `302` to `<team>.cloudflareaccess.com`
+  means Access is in front; a `200` means it is not.
+- **Reverse proxy / VPN** — make sure `/api/*` and `/h/*` are proxied through the
+  same auth, not just the HTML routes.
+
+Everything else is unchanged at the app level: `/api/public/status`, the public
+status pages and the `/h/*` heartbeat endpoints were already unauthenticated by
+design. **But an identity proxy gates a hostname, not a path** — with Access in
+front, heartbeat pushes from outside and shared status-page links are blocked too.
+If you need those, add an Access *Bypass* policy for `/h/*` and `/s/*`, or serve
+them from a second hostname that Access does not cover.
+
+Set it back to `false` (or remove it) to restore the login — existing sessions and
+credentials are untouched.
 
 ---
 

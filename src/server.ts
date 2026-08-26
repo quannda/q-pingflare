@@ -8,7 +8,7 @@ import path from 'node:path'
 import { openSqlite } from './db/shim'
 import { ensureSchema } from './db/migrate'
 import { runCron } from './cron'
-import { requireAuth } from './middleware/auth'
+import { requireAuth, isAuthDisabled } from './middleware/auth'
 import type { Env } from './index'
 
 import authRoutes from './routes/auth'
@@ -37,11 +37,22 @@ async function main() {
     ADMIN_PASS: process.env.ADMIN_PASS ?? '',
     JWT_SECRET: process.env.JWT_SECRET ?? '',
     ENCRYPTION_KEY: process.env.ENCRYPTION_KEY ?? '',
+    AUTH_DISABLED: process.env.AUTH_DISABLED,
   }
 
-  if (!env.ADMIN_USER || !env.ADMIN_PASS || !env.JWT_SECRET || !env.ENCRYPTION_KEY) {
-    console.error('Missing required env vars: ADMIN_USER, ADMIN_PASS, JWT_SECRET, ENCRYPTION_KEY')
+  // With the login bypassed the credential vars are unused, so only the
+  // at-rest encryption key stays mandatory.
+  const required = isAuthDisabled(env)
+    ? (['ENCRYPTION_KEY'] as const)
+    : (['ADMIN_USER', 'ADMIN_PASS', 'JWT_SECRET', 'ENCRYPTION_KEY'] as const)
+  const missing = required.filter((k) => !env[k])
+  if (missing.length > 0) {
+    console.error(`Missing required env vars: ${missing.join(', ')}`)
     process.exit(1)
+  }
+
+  if (isAuthDisabled(env)) {
+    console.warn('[auth] AUTH_DISABLED is set - the API is unauthenticated. Only run this behind a trusted proxy.')
   }
 
   const app = new Hono<{ Bindings: Env }>()

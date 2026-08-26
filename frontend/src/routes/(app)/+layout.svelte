@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation'
   import { page } from '$app/stores'
   import { theme, monitors } from '$lib/stores'
+  import { api } from '$lib/api'
   import { t } from '$lib/i18n'
   import { POLL_INTERVAL_MS } from '$lib/poll'
   import Icon from '$lib/components/Icon.svelte'
@@ -35,9 +36,22 @@
   let updateAvailable = false
   let latestVersion = ''
   let menuOpen = false
+  /** Origin runs behind an external identity proxy -- no login, no sign-out. */
+  let authDisabled = false
 
   onMount(async () => {
-    if (!localStorage.getItem('token')) goto('/login')
+    const hasToken = !!localStorage.getItem('token')
+    const probe = api.auth.config().then(cfg => (authDisabled = cfg.authDisabled))
+    // Anonymous visitors have to wait on the probe before the guard can decide.
+    // With a token already in hand the guard passes either way, so the probe
+    // only feeds the sign-out button and need not block the first paint.
+    if (!hasToken) {
+      await probe
+      if (!authDisabled) {
+        goto('/login')
+        return
+      }
+    }
     countTicker = setInterval(() => {
       countdown = countdown <= 1 ? POLL_INTERVAL_MS / 1000 : countdown - 1
     }, 1000)
@@ -140,13 +154,15 @@
           on:click={() => theme.toggle()}>
           <Icon name={$theme === 'dark' ? 'sun' : 'moon'} size={18} />
         </button>
-        <button
-          type="button"
-          class="btn-outline p-2"
-          aria-label={$t('layout.signOut')}
-          on:click={logout}>
-          <Icon name="arrow-right-on-rect" size={18} />
-        </button>
+        {#if !authDisabled}
+          <button
+            type="button"
+            class="btn-outline p-2"
+            aria-label={$t('layout.signOut')}
+            on:click={logout}>
+            <Icon name="arrow-right-on-rect" size={18} />
+          </button>
+        {/if}
         <!-- Hamburger only on mobile -->
         <button
           type="button"

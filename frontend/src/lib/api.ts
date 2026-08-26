@@ -30,8 +30,21 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>
 }
 
+/**
+ * Cached for the page lifetime: every route guard asks for it, and the answer
+ * only changes when the origin is redeployed. A failed probe is treated as
+ * "auth is on" so a transient error can never unlock the UI.
+ */
+let authConfigPromise: Promise<AuthConfig> | null = null
+function authConfig(): Promise<AuthConfig> {
+  authConfigPromise ??= request<AuthConfig>('/auth/config')
+    .catch(() => ({ authDisabled: false }))
+  return authConfigPromise
+}
+
 export const api = {
   auth: {
+    config: authConfig,
     login: (username: string, password: string) =>
       request<{ token: string }>('/auth/login', {
         method: 'POST',
@@ -109,6 +122,11 @@ export const api = {
                  request<IncidentUpdate>(`/incidents/${id}/updates`, { method: 'POST', body: JSON.stringify({ message, status }) }),
     delete:    (id: string) => request<{ ok: boolean }>(`/incidents/${id}`, { method: 'DELETE' }),
   },
+}
+
+export interface AuthConfig {
+  /** True when the origin delegates authentication to a proxy in front of it. */
+  authDisabled: boolean
 }
 
 export interface Monitor {

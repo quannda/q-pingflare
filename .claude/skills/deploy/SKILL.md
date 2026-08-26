@@ -125,6 +125,22 @@ npx wrangler secret put ENCRYPTION_KEY   # long random string
 npx wrangler secret list                 # confirm all four
 ```
 
+`AUTH_DISABLED = "true"` (a plain `[vars]` entry in `wrangler.toml`, not a secret)
+removes the built-in login for origins already behind Cloudflare Access. It makes
+the first three optional and leaves every `/api` route open to anyone who reaches
+the origin, so confirm Access is actually in front of every hostname the Worker
+answers on before setting it:
+
+```bash
+curl -sI https://q-pingflare.quannda.workers.dev/api/health | head -3
+# 302 -> quannda.cloudflareaccess.com  = protected
+# 200                                   = NOT protected, do not enable the flag
+```
+
+`wrangler`'s OAuth token has no Zero Trust scope, so `GET /accounts/<id>/access/apps`
+returns an empty list whether or not applications exist — the curl above is the
+reliable check, not that API. See "Bypassing the login" in the README.
+
 Secrets survive deploys. They are only needed once, or when rotating.
 `.dev.vars` covers the same values for `wrangler dev` and is gitignored.
 

@@ -12,8 +12,13 @@
   let error = ''
   let loading = false
 
-  onMount(() => {
-    if (localStorage.getItem('token')) goto('/')
+  onMount(async () => {
+    if (localStorage.getItem('token')) {
+      goto('/')
+      return
+    }
+    // Nothing to sign into when the origin delegates auth to a proxy.
+    if ((await api.auth.config()).authDisabled) goto('/')
   })
 
   async function login() {

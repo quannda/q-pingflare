@@ -45,6 +45,17 @@ id = "601d57451663442c98d7ead4e4d34896"
 # At 20 monitors that is ~35k rows written/day here, against a 100k/day free-tier
 # limit. "*/2" (~86k/day) is the tightest safe setting; "* * * * *" would be
 # ~173k/day and blow the limit.
+
+# Removes the built-in login: requireAuth becomes a no-op and the frontend stops
+# redirecting to /login. Safe here only because Cloudflare Access fronts
+# q-pingflare.quannda.workers.dev (team domain quannda.cloudflareaccess.com) --
+# unauthenticated requests are 302'd to the Access login before they reach the
+# Worker. Access covers a hostname, so if a custom domain or a second route is
+# ever added it needs its own Access application, or that hostname becomes an
+# unauthenticated way into every /api route.
+[vars]
+AUTH_DISABLED = "true"
+
 [triggers]
 crons = [
   "*/5 * * * *"

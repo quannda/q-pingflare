@@ -10,6 +10,9 @@ services:
       - ENCRYPTION_KEY=change-me
       - DB_PATH=/data/pingflare.db
       - PORT=3000
+      # Removes the built-in login -- only when an identity proxy already guards
+      # the origin. See "Bypassing the login" in the README.
+      # - AUTH_DISABLED=true
     volumes:
       - pingflare-data:/data
     restart: unless-stopped

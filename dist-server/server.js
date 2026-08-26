@@ -2245,7 +2245,12 @@ async function invalidatePublicPages(db, env, monitorIds) {
 // src/middleware/auth.ts
 var import_factory = require("hono/factory");
 var import_jose = require("jose");
+function isAuthDisabled(env) {
+  const v = env.AUTH_DISABLED;
+  return v === "true" || v === "1";
+}
 var requireAuth = (0, import_factory.createMiddleware)(async (c, next) => {
+  if (isAuthDisabled(c.env)) return next();
   const authorization = c.req.header("Authorization");
   if (!authorization?.startsWith("Bearer ")) {
     return c.json({ error: "Unauthorized" }, 401);
@@ -2268,8 +2273,12 @@ async function issueToken(sub, secret) {
   const key = new TextEncoder().encode(secret);
   return new import_jose2.SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).setIssuedAt().setExpirationTime("30d").sign(key);
 }
+auth.get("/config", (c) => c.json({ authDisabled: isAuthDisabled(c.env) }));
 auth.post("/login", async (c) => {
   const body = await c.req.json();
+  if (!c.env.ADMIN_USER || !c.env.ADMIN_PASS || !c.env.JWT_SECRET) {
+    return c.json({ error: "Password login is not configured" }, 400);
+  }
   if (body.username !== c.env.ADMIN_USER || body.password !== c.env.ADMIN_PASS) {
     return c.json({ error: "Invalid credentials" }, 401);
   }
@@ -3281,11 +3290,17 @@ async function main() {
     ADMIN_USER: process.env.ADMIN_USER ?? "",
     ADMIN_PASS: process.env.ADMIN_PASS ?? "",
     JWT_SECRET: process.env.JWT_SECRET ?? "",
-    ENCRYPTION_KEY: process.env.ENCRYPTION_KEY ?? ""
+    ENCRYPTION_KEY: process.env.ENCRYPTION_KEY ?? "",
+    AUTH_DISABLED: process.env.AUTH_DISABLED
   };
-  if (!env.ADMIN_USER || !env.ADMIN_PASS || !env.JWT_SECRET || !env.ENCRYPTION_KEY) {
-    console.error("Missing required env vars: ADMIN_USER, ADMIN_PASS, JWT_SECRET, ENCRYPTION_KEY");
+  const required = isAuthDisabled(env) ? ["ENCRYPTION_KEY"] : ["ADMIN_USER", "ADMIN_PASS", "JWT_SECRET", "ENCRYPTION_KEY"];
+  const missing = required.filter((k) => !env[k]);
+  if (missing.length > 0) {
+    console.error(`Missing required env vars: ${missing.join(", ")}`);
     process.exit(1);
+  }
+  if (isAuthDisabled(env)) {
+    console.warn("[auth] AUTH_DISABLED is set - the API is unauthenticated. Only run this behind a trusted proxy.");
   }
   const app2 = new import_hono12.Hono();
   app2.use("/api/*", (0, import_cors.cors)());

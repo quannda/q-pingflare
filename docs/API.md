@@ -11,6 +11,11 @@ Obtain a token by calling `POST /api/auth/login`
 |---|---|---|
 | POST | `/api/auth/login` | Returns a JWT token valid for 30 days |
 | POST | `/api/auth/refresh` | Exchanges a valid token for a new one with a fresh 30-day expiry |
+| GET  | `/api/auth/config` | Public. `{ authDisabled }` — true when `AUTH_DISABLED` is set and the bearer token is not required |
+
+With `AUTH_DISABLED=true` every authenticated endpoint below accepts requests with
+no `Authorization` header at all, and `POST /api/auth/login` returns `400` unless
+the credential env vars are also set. See "Bypassing the login" in the README.
 
 ---
 

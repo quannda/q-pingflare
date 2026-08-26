@@ -21,6 +21,7 @@ primary_region = "iad"
     soft_limit = 80
 
 [env]
+  # AUTH_DISABLED = "true"   # removes the built-in login; only behind a trusted proxy
   PORT = "3000"
   NODE_ENV = "production"
   DB_PATH = "/data/pingflare.db"

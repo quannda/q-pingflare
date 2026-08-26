@@ -2,3 +2,7 @@ ADMIN_USER=admin
 ADMIN_PASS=changeme
 JWT_SECRET=replace-with-a-long-random-string
 ENCRYPTION_KEY=replace-with-a-long-random-string
+
+# Set to true only when an identity proxy (Cloudflare Access, SSO) already
+# guards the origin: removes the built-in login and leaves /api unauthenticated.
+# AUTH_DISABLED=true
